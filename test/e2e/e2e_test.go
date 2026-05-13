@@ -2032,5 +2032,99 @@ var _ = Describe("Zero Trust Workload Identity Manager", Ordered, func() {
 					}
 				}
 			})
+
+		It("spire-agent SCC AllowHostNetwork must be reconciled back to false if reverted",
+			Label("openshift-scc", "reconciliation"), func() {
+				By("Fetching the spire-agent SCC")
+				scc := &securityv1.SecurityContextConstraints{}
+				err := k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, scc)
+				Expect(err).NotTo(HaveOccurred(), "failed to get SCC %s", utils.SpireAgentSCCName)
+
+				By("Reverting AllowHostNetwork to true to introduce drift")
+				scc.AllowHostNetwork = true
+				err = k8sClient.Update(testCtx, scc)
+				Expect(err).NotTo(HaveOccurred(), "failed to update SCC to introduce AllowHostNetwork drift")
+
+				DeferCleanup(func(ctx context.Context) {
+					current := &securityv1.SecurityContextConstraints{}
+					if err := k8sClient.Get(ctx, types.NamespacedName{Name: utils.SpireAgentSCCName}, current); err == nil {
+						if current.AllowHostNetwork {
+							current.AllowHostNetwork = false
+							_ = k8sClient.Update(ctx, current)
+						}
+					}
+				})
+
+				By("Waiting for reconciler to restore AllowHostNetwork=false")
+				Eventually(func() bool {
+					current := &securityv1.SecurityContextConstraints{}
+					if err := k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, current); err != nil {
+						return false
+					}
+					return !current.AllowHostNetwork
+				}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue(),
+					"reconciler must restore spire-agent SCC AllowHostNetwork=false within %v", utils.DefaultTimeout)
+			})
+
+		It("SpireAgent DaemonSet pods must retain hardened security context after a rolling update",
+			Label("security-context", "controller-manager", "reconciliation"), func() {
+				By("Getting SpireAgent object")
+				spireAgent := &operatorv1alpha1.SpireAgent{}
+				err := k8sClient.Get(testCtx, client.ObjectKey{Name: "cluster"}, spireAgent)
+				Expect(err).NotTo(HaveOccurred(), "failed to get SpireAgent object")
+
+				daemonset, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentDaemonSetName, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred(), "failed to get SpireAgent DaemonSet")
+				initialGen := daemonset.Generation
+
+				By("Triggering a rolling update by patching SpireAgent with a probe label")
+				err = utils.UpdateCRWithRetry(testCtx, k8sClient, spireAgent, func() {
+					if spireAgent.Spec.Labels == nil {
+						spireAgent.Spec.Labels = map[string]string{}
+					}
+					spireAgent.Spec.Labels["e2e-scc-hardening"] = "rolling-update-probe"
+				})
+				Expect(err).NotTo(HaveOccurred(), "failed to patch SpireAgent with probe label")
+				DeferCleanup(func(ctx context.Context) {
+					agent := &operatorv1alpha1.SpireAgent{}
+					if err := k8sClient.Get(ctx, client.ObjectKey{Name: "cluster"}, agent); err == nil {
+						delete(agent.Spec.Labels, "e2e-scc-hardening")
+						_ = k8sClient.Update(ctx, agent)
+					}
+				})
+
+				By("Waiting for DaemonSet rolling update to start")
+				utils.WaitForDaemonSetRollingUpdate(testCtx, clientset, utils.SpireAgentDaemonSetName, utils.OperatorNamespace, initialGen, utils.DefaultTimeout)
+
+				By("Waiting for DaemonSet to become Available")
+				utils.WaitForDaemonSetAvailable(testCtx, clientset, utils.SpireAgentDaemonSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+				By("Verifying new pods carry the hardened security context")
+				pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{
+					LabelSelector: utils.SpireAgentPodLabel,
+				})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(pods.Items).NotTo(BeEmpty())
+				for _, pod := range pods.Items {
+					Expect(pod.Spec.HostNetwork).To(BeFalse(), "new pod %s must have HostNetwork=false after rolling update", pod.Name)
+					Expect(pod.Spec.DNSPolicy).To(Equal(corev1.DNSClusterFirst), "new pod %s must use DNSClusterFirst after rolling update", pod.Name)
+					for _, c := range pod.Spec.Containers {
+						Expect(c.SecurityContext).NotTo(BeNil())
+						Expect(c.SecurityContext.Privileged).To(Equal(ptr.To(false)))
+						Expect(c.SecurityContext.AllowPrivilegeEscalation).To(Equal(ptr.To(false)))
+						Expect(c.SecurityContext.ReadOnlyRootFilesystem).To(Equal(ptr.To(true)))
+					}
+				}
+
+				By("Sweeping container statuses for crash loops on new pods (RULE-E2E-SEC-01)")
+				for _, pod := range pods.Items {
+					for _, cs := range pod.Status.ContainerStatuses {
+						Expect(cs.State.Waiting).To(BeNil(),
+							"container %s in new pod %s is in Waiting state after rolling update", cs.Name, pod.Name)
+						Expect(cs.RestartCount).To(BeNumerically("<", 3),
+							"container %s in new pod %s has restarted %d times after rolling update", cs.Name, pod.Name, cs.RestartCount)
+					}
+				}
+			})
 	})
 })
