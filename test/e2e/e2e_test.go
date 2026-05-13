@@ -24,6 +24,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	securityv1 "github.com/openshift/api/security/v1"
 	operatorv1alpha1 "github.com/openshift/zero-trust-workload-identity-manager/api/v1alpha1"
 	"github.com/openshift/zero-trust-workload-identity-manager/test/e2e/utils"
 	spiffev1alpha1 "github.com/spiffe/spire-controller-manager/api/v1alpha1"
@@ -1800,5 +1801,330 @@ var _ = Describe("Zero Trust Workload Identity Manager", Ordered, func() {
 			}).WithPolling(utils.ShortInterval).WithTimeout(utils.ShortTimeout).Should(BeTrue(),
 				"ConfigMap drift should be corrected when CreateOnlyMode is False")
 		})
+	})
+
+	// SPIRE-439: SCC Hardening for Spire Agent
+	// Tests: SPIRE-439-TC-001 through SPIRE-439-TC-008
+	// Covered by existing spec: AC-10 (workload attestation) — see SpireAgent attestation context.
+	Context("SpireAgent security hardening", func() {
+		It("SpireAgent DaemonSet pod spec must enforce network isolation and non-privileged execution",
+			Label("security-context", "openshift-scc", "controller-manager"), func() {
+				By("Listing SpireAgent pods")
+				pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{
+					LabelSelector: utils.SpireAgentPodLabel,
+				})
+				Expect(err).NotTo(HaveOccurred(), "failed to list SpireAgent pods")
+				Expect(pods.Items).NotTo(BeEmpty(), "no SpireAgent pods found in namespace %s", utils.OperatorNamespace)
+
+				By("Verifying pod-level network isolation and host access fields")
+				for _, pod := range pods.Items {
+					Expect(pod.Spec.HostNetwork).To(BeFalse(),
+						"pod %s must have HostNetwork=false (SCC allowHostNetwork: false)", pod.Name)
+					Expect(pod.Spec.DNSPolicy).To(Equal(corev1.DNSClusterFirst),
+						"pod %s must use DNSClusterFirst after HostNetwork was disabled", pod.Name)
+					Expect(pod.Spec.HostPID).To(BeTrue(),
+						"pod %s must retain HostPID=true for k8s workload attestation", pod.Name)
+				}
+
+				By("Verifying container security context on all SpireAgent containers")
+				for _, pod := range pods.Items {
+					for _, c := range pod.Spec.Containers {
+						Expect(c.SecurityContext).NotTo(BeNil(),
+							"container %s in pod %s must have SecurityContext set", c.Name, pod.Name)
+						sc := c.SecurityContext
+						Expect(sc.Privileged).To(Equal(ptr.To(false)),
+							"container %s in pod %s must not be privileged", c.Name, pod.Name)
+						Expect(sc.AllowPrivilegeEscalation).To(Equal(ptr.To(false)),
+							"container %s in pod %s must have AllowPrivilegeEscalation=false", c.Name, pod.Name)
+						Expect(sc.ReadOnlyRootFilesystem).To(Equal(ptr.To(true)),
+							"container %s in pod %s must have ReadOnlyRootFilesystem=true", c.Name, pod.Name)
+						Expect(sc.Capabilities).NotTo(BeNil(),
+							"container %s in pod %s must have Capabilities set", c.Name, pod.Name)
+						Expect(sc.Capabilities.Drop).To(ContainElement(corev1.Capability("ALL")),
+							"container %s in pod %s must drop ALL capabilities", c.Name, pod.Name)
+					}
+				}
+			})
+
+		It("spire-agent SCC must restrict host access and privileged container execution",
+			Label("openshift-scc", "security-context"), func() {
+				By("Fetching the spire-agent SecurityContextConstraints")
+				scc := &securityv1.SecurityContextConstraints{}
+				err := k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, scc)
+				Expect(err).NotTo(HaveOccurred(), "failed to get SCC %s", utils.SpireAgentSCCName)
+
+				By("Verifying network restriction fields")
+				Expect(scc.AllowHostNetwork).To(BeFalse(), "SCC must have AllowHostNetwork=false")
+				Expect(scc.AllowHostPorts).To(BeFalse(), "SCC must have AllowHostPorts=false")
+				Expect(scc.AllowHostPID).To(BeTrue(), "SCC must retain AllowHostPID=true for workload attestation")
+				Expect(scc.AllowHostIPC).To(BeFalse(), "SCC must have AllowHostIPC=false")
+
+				By("Verifying privilege restriction fields")
+				Expect(scc.AllowPrivilegedContainer).To(BeFalse(), "SCC must have AllowPrivilegedContainer=false")
+				Expect(scc.AllowPrivilegeEscalation).To(Equal(ptr.To(false)), "SCC must have AllowPrivilegeEscalation=*false")
+
+				By("Verifying filesystem and capability fields")
+				Expect(scc.ReadOnlyRootFilesystem).To(BeTrue(), "SCC must have ReadOnlyRootFilesystem=true")
+				Expect(scc.RequiredDropCapabilities).To(ContainElement(corev1.Capability("ALL")),
+					"SCC must require dropping ALL capabilities")
+				Expect(scc.AllowedCapabilities).To(BeEmpty(), "SCC must not allow any additional capabilities")
+
+				By("Verifying RunAsUser strategy")
+				Expect(scc.RunAsUser.Type).To(Equal(securityv1.RunAsUserStrategyRunAsAny),
+					"SCC RunAsUser.Type must be RunAsAny (SPIRE Agent image sets UID internally)")
+			})
+
+		It("SpireAgent pods must be admitted under the spire-agent SCC",
+			Label("openshift-scc", "security-context"), func() {
+				By("Listing SpireAgent pods")
+				pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{
+					LabelSelector: utils.SpireAgentPodLabel,
+				})
+				Expect(err).NotTo(HaveOccurred(), "failed to list SpireAgent pods")
+				Expect(pods.Items).NotTo(BeEmpty(), "no SpireAgent pods found")
+
+				By("Verifying SCC admission annotation on each pod")
+				for _, pod := range pods.Items {
+					sccAnnotation, ok := pod.Annotations["openshift.io/scc"]
+					Expect(ok).To(BeTrue(), "pod %s must carry the openshift.io/scc annotation", pod.Name)
+					Expect(sccAnnotation).To(Equal(utils.SpireAgentSCCName),
+						"pod %s must be admitted under the %s SCC, not a privileged fallback", pod.Name, utils.SpireAgentSCCName)
+				}
+			})
+
+		It("SpireAgent container root filesystem must be read-only with accessible volume-backed paths",
+			Label("security-context", "openshift-scc"), func() {
+				By("Selecting a SpireAgent pod for exec probes")
+				pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{
+					LabelSelector: utils.SpireAgentPodLabel,
+				})
+				Expect(err).NotTo(HaveOccurred(), "failed to list SpireAgent pods")
+				Expect(pods.Items).NotTo(BeEmpty(), "no SpireAgent pods found")
+				pod := pods.Items[0]
+
+				By("Scanning pod logs to confirm no pre-existing read-only filesystem errors")
+				req := clientset.CoreV1().Pods(utils.OperatorNamespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+					Container: utils.SpireAgentContainerName,
+					TailLines: ptr.To(int64(50)),
+				})
+				rawLogs, logErr := req.DoRaw(testCtx)
+				Expect(logErr).NotTo(HaveOccurred(), "failed to get logs from pod %s", pod.Name)
+				Expect(string(rawLogs)).NotTo(ContainSubstring("read-only file system"),
+					"pod %s must not log read-only filesystem errors on startup", pod.Name)
+
+				By("Probing that root filesystem rejects writes (SCC ReadOnlyRootFilesystem: true)")
+				// The 'true' exit code prevents exec failure; we inspect stderr for the enforcement message.
+				_, stderr, _ := utils.ExecInPod(testCtx, utils.OperatorNamespace, pod.Name,
+					utils.SpireAgentContainerName,
+					[]string{"sh", "-c", "touch /.rofs-probe 2>&1; true"})
+				Expect(stderr).To(ContainSubstring("read-only file system"),
+					"container %s root filesystem must reject writes", utils.SpireAgentContainerName)
+
+				By("Probing that a volume-backed path is accessible (writable EmptyDir mount)")
+				// /tmp is mounted as EmptyDir for socket and temp file access.
+				stdout, _, execErr := utils.ExecInPod(testCtx, utils.OperatorNamespace, pod.Name,
+					utils.SpireAgentContainerName,
+					[]string{"ls", "/tmp"})
+				Expect(execErr).NotTo(HaveOccurred(),
+					"volume-backed /tmp path must be accessible in container %s", utils.SpireAgentContainerName)
+				_ = stdout
+			})
+
+		It("SpireAgent container must not run as UID 0 at runtime",
+			Label("security-context", "openshift-scc"), func() {
+				// SCC RunAsUser.Type: RunAsAny defers UID selection to the container image default.
+				// This probe confirms the image does not default to root even without MustRunAsRange enforcement.
+				By("Selecting a SpireAgent pod for UID exec probe")
+				pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{
+					LabelSelector: utils.SpireAgentPodLabel,
+				})
+				Expect(err).NotTo(HaveOccurred(), "failed to list SpireAgent pods")
+				Expect(pods.Items).NotTo(BeEmpty(), "no SpireAgent pods found")
+				pod := pods.Items[0]
+
+				By("Executing 'id -u' in the spire-agent container")
+				stdout, _, execErr := utils.ExecInPod(testCtx, utils.OperatorNamespace, pod.Name,
+					utils.SpireAgentContainerName, []string{"id", "-u"})
+				Expect(execErr).NotTo(HaveOccurred(),
+					"failed to exec 'id -u' in container %s of pod %s", utils.SpireAgentContainerName, pod.Name)
+				Expect(strings.TrimSpace(stdout)).NotTo(Equal("0"),
+					"container %s in pod %s must not run as UID 0; SCC RunAsAny defers to image default — image must not default to root",
+					utils.SpireAgentContainerName, pod.Name)
+			})
+
+		It("SpireAgent pod logs must be free of DNS, network, and filesystem errors after SCC hardening",
+			Label("security-context", "openshift-scc"), func() {
+				By("Listing SpireAgent pods for log scan")
+				pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{
+					LabelSelector: utils.SpireAgentPodLabel,
+				})
+				Expect(err).NotTo(HaveOccurred(), "failed to list SpireAgent pods")
+				Expect(pods.Items).NotTo(BeEmpty(), "no SpireAgent pods found")
+
+				By("Scanning pod logs for network/filesystem errors after SCC policy change")
+				for _, pod := range pods.Items {
+					req := clientset.CoreV1().Pods(utils.OperatorNamespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+						Container: utils.SpireAgentContainerName,
+						TailLines: ptr.To(int64(100)),
+					})
+					rawLogs, logErr := req.DoRaw(testCtx)
+					Expect(logErr).NotTo(HaveOccurred(), "failed to get logs from pod %s", pod.Name)
+					logStr := string(rawLogs)
+					Expect(logStr).NotTo(ContainSubstring("no such host"),
+						"pod %s must not have DNS lookup failures after disabling HostNetwork", pod.Name)
+					Expect(logStr).NotTo(ContainSubstring("network unreachable"),
+						"pod %s must not have network unreachable errors", pod.Name)
+					Expect(logStr).NotTo(ContainSubstring("connection refused"),
+						"pod %s must not have connection refused errors on startup", pod.Name)
+					Expect(logStr).NotTo(ContainSubstring("read-only file system"),
+						"pod %s must not have read-only filesystem errors after ReadOnlyRootFilesystem enforcement", pod.Name)
+				}
+			})
+
+		It("SpireAgent DaemonSet pods must not be in crash loop or OOM state after SCC hardening",
+			Label("security-context", "controller-manager"), func() {
+				By("Listing SpireAgent pods for container health check")
+				pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{
+					LabelSelector: utils.SpireAgentPodLabel,
+				})
+				Expect(err).NotTo(HaveOccurred(), "failed to list SpireAgent pods")
+				Expect(pods.Items).NotTo(BeEmpty(), "no SpireAgent pods found")
+
+				By("Checking container statuses for crash loops and OOM kills")
+				for _, pod := range pods.Items {
+					for _, cs := range pod.Status.ContainerStatuses {
+						Expect(cs.State.Waiting).To(BeNil(),
+							"container %s in pod %s is in Waiting state (CrashLoopBackOff/OOMKilled?)", cs.Name, pod.Name)
+						Expect(cs.RestartCount).To(BeNumerically("<", 3),
+							"container %s in pod %s has restarted %d times — indicates crash loop after SCC hardening",
+							cs.Name, pod.Name, cs.RestartCount)
+					}
+				}
+			})
+
+		It("SpireAgent container seccompProfile must satisfy OCP seccomp enforcement policy",
+			Label("security-context", "openshift-scc"), func() {
+				By("Listing SpireAgent pods for seccompProfile check")
+				pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{
+					LabelSelector: utils.SpireAgentPodLabel,
+				})
+				Expect(err).NotTo(HaveOccurred(), "failed to list SpireAgent pods")
+				Expect(pods.Items).NotTo(BeEmpty(), "no SpireAgent pods found")
+
+				By("Fetching spire-agent SCC for tier-2 seccomp check")
+				scc := &securityv1.SecurityContextConstraints{}
+				sccErr := k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, scc)
+				Expect(sccErr).NotTo(HaveOccurred(), "failed to get SCC %s for seccomp tier-2 check", utils.SpireAgentSCCName)
+
+				By("Applying two-tier OCP seccomp enforcement model to each container")
+				for _, pod := range pods.Items {
+					for _, c := range pod.Spec.Containers {
+						if c.SecurityContext != nil && c.SecurityContext.SeccompProfile != nil {
+							// Tier 1: explicitly set in pod spec — assert RuntimeDefault.
+							Expect(c.SecurityContext.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault),
+								"container %s in pod %s must use RuntimeDefault seccomp profile", c.Name, pod.Name)
+						} else {
+							// Tier 2: not in pod spec; OCP admission must inject it via the SCC.
+							Expect(scc.SeccompProfiles).To(ContainElement("runtime/default"),
+								"seccompProfile absent from pod spec for container %s in pod %s; SCC %s must list runtime/default so OCP admission injects it",
+								c.Name, pod.Name, utils.SpireAgentSCCName)
+						}
+					}
+				}
+			})
+
+		It("spire-agent SCC AllowHostNetwork must be reconciled back to false if reverted",
+			Label("openshift-scc", "reconciliation"), func() {
+				By("Fetching the spire-agent SCC")
+				scc := &securityv1.SecurityContextConstraints{}
+				err := k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, scc)
+				Expect(err).NotTo(HaveOccurred(), "failed to get SCC %s", utils.SpireAgentSCCName)
+
+				By("Reverting AllowHostNetwork to true to introduce drift")
+				scc.AllowHostNetwork = true
+				err = k8sClient.Update(testCtx, scc)
+				Expect(err).NotTo(HaveOccurred(), "failed to update SCC to introduce AllowHostNetwork drift")
+
+				DeferCleanup(func(ctx context.Context) {
+					current := &securityv1.SecurityContextConstraints{}
+					if err := k8sClient.Get(ctx, types.NamespacedName{Name: utils.SpireAgentSCCName}, current); err == nil {
+						if current.AllowHostNetwork {
+							current.AllowHostNetwork = false
+							_ = k8sClient.Update(ctx, current)
+						}
+					}
+				})
+
+				By("Waiting for reconciler to restore AllowHostNetwork=false")
+				Eventually(func() bool {
+					current := &securityv1.SecurityContextConstraints{}
+					if err := k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, current); err != nil {
+						return false
+					}
+					return !current.AllowHostNetwork
+				}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue(),
+					"reconciler must restore spire-agent SCC AllowHostNetwork=false within %v", utils.DefaultTimeout)
+			})
+
+		It("SpireAgent DaemonSet pods must retain hardened security context after a rolling update",
+			Label("security-context", "controller-manager", "reconciliation"), func() {
+				By("Getting SpireAgent object")
+				spireAgent := &operatorv1alpha1.SpireAgent{}
+				err := k8sClient.Get(testCtx, client.ObjectKey{Name: "cluster"}, spireAgent)
+				Expect(err).NotTo(HaveOccurred(), "failed to get SpireAgent object")
+
+				daemonset, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentDaemonSetName, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred(), "failed to get SpireAgent DaemonSet")
+				initialGen := daemonset.Generation
+
+				By("Triggering a rolling update by patching SpireAgent with a probe label")
+				err = utils.UpdateCRWithRetry(testCtx, k8sClient, spireAgent, func() {
+					if spireAgent.Spec.Labels == nil {
+						spireAgent.Spec.Labels = map[string]string{}
+					}
+					spireAgent.Spec.Labels["e2e-scc-hardening"] = "rolling-update-probe"
+				})
+				Expect(err).NotTo(HaveOccurred(), "failed to patch SpireAgent with probe label")
+				DeferCleanup(func(ctx context.Context) {
+					agent := &operatorv1alpha1.SpireAgent{}
+					if err := k8sClient.Get(ctx, client.ObjectKey{Name: "cluster"}, agent); err == nil {
+						delete(agent.Spec.Labels, "e2e-scc-hardening")
+						_ = k8sClient.Update(ctx, agent)
+					}
+				})
+
+				By("Waiting for DaemonSet rolling update to start")
+				utils.WaitForDaemonSetRollingUpdate(testCtx, clientset, utils.SpireAgentDaemonSetName, utils.OperatorNamespace, initialGen, utils.DefaultTimeout)
+
+				By("Waiting for DaemonSet to become Available")
+				utils.WaitForDaemonSetAvailable(testCtx, clientset, utils.SpireAgentDaemonSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+				By("Verifying new pods carry the hardened security context")
+				pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{
+					LabelSelector: utils.SpireAgentPodLabel,
+				})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(pods.Items).NotTo(BeEmpty())
+				for _, pod := range pods.Items {
+					Expect(pod.Spec.HostNetwork).To(BeFalse(), "new pod %s must have HostNetwork=false after rolling update", pod.Name)
+					Expect(pod.Spec.DNSPolicy).To(Equal(corev1.DNSClusterFirst), "new pod %s must use DNSClusterFirst after rolling update", pod.Name)
+					for _, c := range pod.Spec.Containers {
+						Expect(c.SecurityContext).NotTo(BeNil())
+						Expect(c.SecurityContext.Privileged).To(Equal(ptr.To(false)))
+						Expect(c.SecurityContext.AllowPrivilegeEscalation).To(Equal(ptr.To(false)))
+						Expect(c.SecurityContext.ReadOnlyRootFilesystem).To(Equal(ptr.To(true)))
+					}
+				}
+
+				By("Sweeping container statuses for crash loops on new pods (RULE-E2E-SEC-01)")
+				for _, pod := range pods.Items {
+					for _, cs := range pod.Status.ContainerStatuses {
+						Expect(cs.State.Waiting).To(BeNil(),
+							"container %s in new pod %s is in Waiting state after rolling update", cs.Name, pod.Name)
+						Expect(cs.RestartCount).To(BeNumerically("<", 3),
+							"container %s in new pod %s has restarted %d times after rolling update", cs.Name, pod.Name, cs.RestartCount)
+					}
+				}
+			})
 	})
 })
