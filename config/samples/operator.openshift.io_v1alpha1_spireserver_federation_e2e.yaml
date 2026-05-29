@@ -1,0 +1,57 @@
+apiVersion: operator.openshift.io/v1alpha1
+kind: SpireServer
+metadata:
+  labels:
+    app.kubernetes.io/name: zero-trust-workload-identity-manager
+    app.kubernetes.io/created-by: zero-trust-workload-identity-manager
+    app.kubernetes.io/part-of: zero-trust-workload-identity-manager
+    app.kubernetes.io/managed-by: zero-trust-workload-identity-manager
+  name: cluster
+spec:
+  logLevel: info
+  logFormat: text
+  jwtIssuer: "https://oidc-discovery.example.com"
+  caValidity: 24h
+  defaultX509Validity: 1h
+  defaultJWTValidity: 5m
+  caKeyType: rsa-2048
+  caSubject:
+    commonName: "SPIRE Server CA"
+    organization: "Test Corp"
+    country: "US"
+  datastore:
+    databaseType: sqlite3
+    connectionString: "/run/spire/data/datastore.sqlite3"
+    maxOpenConns: 100
+    maxIdleConns: 2
+  persistence:
+    size: "2Gi"
+    accessMode: ReadWriteOnce
+    storageClass: ""
+  # Federation configuration for E2E testing
+  federation:
+    bundleEndpoint:
+      # Example 1: https_spiffe profile (requires SPIFFE mutual TLS)
+      profile: https_spiffe
+      refreshHint: 300
+      # Example 2: https_web profile with ServingCert (uncomment to use)
+      # profile: https_web
+      # httpsWeb:
+      #   servingCert:
+      #     externalSecretRef: "federation-tls-cert"
+      #     fileSyncInterval: 86400  # 24 hours
+    # Configure federation relationships with other trust domains
+    federatesWith:
+      # Example https_spiffe federation
+      - trustDomain: "testa.example"
+        bundleEndpointUrl: "https://federation.testa.example:8443"
+        bundleEndpointProfile: https_spiffe
+        # endpointSpiffeId required for https_spiffe profile
+        endpointSpiffeId: "spiffe://testa.example/federation/endpoint"
+      # Example https_web federation
+      - trustDomain: "testb.example"
+        bundleEndpointUrl: "https://federation.testb.example:8443"
+        bundleEndpointProfile: https_web
+        # endpointSpiffeId not required for https_web profile
+    # Enable automatic OpenShift Route creation for federation endpoint
+    managedRoute: "true"

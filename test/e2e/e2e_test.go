@@ -24,11 +24,14 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	routev1 "github.com/openshift/api/route/v1"
+	securityv1 "github.com/openshift/api/security/v1"
 	operatorv1alpha1 "github.com/openshift/zero-trust-workload-identity-manager/api/v1alpha1"
 	"github.com/openshift/zero-trust-workload-identity-manager/test/e2e/utils"
 	spiffev1alpha1 "github.com/spiffe/spire-controller-manager/api/v1alpha1"
 
 	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -1690,6 +1693,295 @@ var _ = Describe("Zero Trust Workload Identity Manager", Ordered, func() {
 		})
 	})
 
+	Context("SPIRE Agent SCC Hardening", func() {
+		It("SPIRE Agent SCC object fields should match hardened configuration", Label("openshift-scc", "security-context"), func() {
+			By("Fetching the spire-agent SCC")
+			scc := &securityv1.SecurityContextConstraints{}
+			err := k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, scc)
+			Expect(err).NotTo(HaveOccurred(), "failed to get SCC %s", utils.SpireAgentSCCName)
+
+			By("Asserting SCC host-level isolation fields")
+			Expect(scc.AllowHostNetwork).To(BeFalse(), "AllowHostNetwork must be false after hardening")
+			Expect(scc.AllowHostPorts).To(BeFalse(), "AllowHostPorts must be false after hardening")
+			Expect(scc.AllowHostPID).To(BeTrue(), "AllowHostPID must remain true for workload attestation")
+			Expect(scc.AllowHostIPC).To(BeFalse(), "AllowHostIPC must be false")
+			Expect(scc.AllowHostDirVolumePlugin).To(BeTrue(), "AllowHostDirVolumePlugin must remain true for agent socket hostPath")
+
+			By("Asserting SCC privilege fields")
+			Expect(scc.AllowPrivilegeEscalation).To(Equal(ptr.To(false)), "AllowPrivilegeEscalation must be false after hardening")
+			Expect(scc.AllowPrivilegedContainer).To(BeFalse(), "AllowPrivilegedContainer must be false after hardening")
+
+			By("Asserting SCC filesystem and capability fields")
+			Expect(scc.ReadOnlyRootFilesystem).To(BeTrue(), "ReadOnlyRootFilesystem must be true")
+			Expect(scc.RequiredDropCapabilities).To(ContainElement(corev1.Capability("ALL")), "RequiredDropCapabilities must include ALL")
+
+			By("Asserting SCC RunAsUser strategy")
+			Expect(scc.RunAsUser.Type).To(Equal(securityv1.RunAsUserStrategyRunAsAny), "RunAsUser.Type must be RunAsAny after hardening")
+		})
+
+		It("SPIRE Agent DaemonSet PodSpec and container SecurityContext should match hardened configuration", Label("security-context"), func() {
+			By("Getting the spire-agent DaemonSet")
+			ds, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentDaemonSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get spire-agent DaemonSet")
+
+			By("Asserting DaemonSet PodSpec network and host fields")
+			podSpec := ds.Spec.Template.Spec
+			Expect(podSpec.HostNetwork).To(BeFalse(), "HostNetwork must be false after hardening")
+			Expect(podSpec.HostPID).To(BeTrue(), "HostPID must remain true for workload attestation")
+			Expect(podSpec.DNSPolicy).To(Equal(corev1.DNSClusterFirst), "DNSPolicy must be ClusterFirst after hardening")
+
+			By("Asserting spire-agent container SecurityContext")
+			Expect(podSpec.Containers).NotTo(BeEmpty(), "DaemonSet must have at least one container")
+			var agentContainer *corev1.Container
+			for i := range podSpec.Containers {
+				if podSpec.Containers[i].Name == "spire-agent" {
+					agentContainer = &podSpec.Containers[i]
+					break
+				}
+			}
+			Expect(agentContainer).NotTo(BeNil(), "spire-agent container must exist")
+			Expect(agentContainer.SecurityContext).NotTo(BeNil(), "spire-agent container must have SecurityContext")
+
+			sc := agentContainer.SecurityContext
+			Expect(sc.Privileged).To(Equal(ptr.To(false)), "container must not be privileged")
+			Expect(sc.AllowPrivilegeEscalation).To(Equal(ptr.To(false)), "container must disallow privilege escalation")
+			Expect(sc.ReadOnlyRootFilesystem).To(Equal(ptr.To(true)), "container must use read-only root filesystem")
+			Expect(sc.Capabilities).NotTo(BeNil(), "Capabilities must be set")
+			Expect(sc.Capabilities.Drop).To(ContainElement(corev1.Capability("ALL")), "container must drop ALL capabilities")
+		})
+
+		It("SPIRE Agent pods should be admitted under the spire-agent SCC", Label("openshift-scc"), func() {
+			By("Listing SPIRE Agent pods")
+			pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{LabelSelector: utils.SpireAgentPodLabel})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pods.Items).NotTo(BeEmpty(), "no SPIRE Agent pods found")
+
+			By("Verifying each pod is admitted under the spire-agent SCC")
+			for _, pod := range pods.Items {
+				sccAnnotation, ok := pod.Annotations["openshift.io/scc"]
+				Expect(ok).To(BeTrue(), "pod %s must carry the openshift.io/scc annotation", pod.Name)
+				Expect(sccAnnotation).To(Equal(utils.SpireAgentSCCName),
+					"pod %s must be admitted under SCC %s, got %s", pod.Name, utils.SpireAgentSCCName, sccAnnotation)
+				fmt.Fprintf(GinkgoWriter, "pod '%s' admitted under SCC '%s'\n", pod.Name, sccAnnotation)
+			}
+		})
+
+		It("SPIRE Agent containers should be healthy after SCC hardening", Label("security-context", "install-health"), func() {
+			By("Listing SPIRE Agent pods")
+			pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{LabelSelector: utils.SpireAgentPodLabel})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pods.Items).NotTo(BeEmpty(), "no SPIRE Agent pods found")
+
+			By("Sweeping container statuses for crash loops or waiting states")
+			for _, pod := range pods.Items {
+				for _, cs := range pod.Status.ContainerStatuses {
+					Expect(cs.State.Waiting).To(BeNil(),
+						"container %s in pod %s is in Waiting state (CrashLoopBackOff/OOMKilled?)", cs.Name, pod.Name)
+					Expect(cs.RestartCount).To(BeNumerically("<", 3),
+						"container %s in pod %s has restarted %d times", cs.Name, pod.Name, cs.RestartCount)
+				}
+				fmt.Fprintf(GinkgoWriter, "pod '%s' containers are healthy (no crash loops)\n", pod.Name)
+			}
+		})
+
+		It("SPIRE Agent pod logs should have no DNS/network/filesystem errors after hardening", Label("security-context"), func() {
+			By("Listing SPIRE Agent pods")
+			pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{LabelSelector: utils.SpireAgentPodLabel})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pods.Items).NotTo(BeEmpty(), "no SPIRE Agent pods found")
+
+			By("Scanning pod logs for network/filesystem errors after policy change")
+			for _, pod := range pods.Items {
+				req := clientset.CoreV1().Pods(utils.OperatorNamespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+					TailLines: ptr.To(int64(100)),
+				})
+				rawLogs, logErr := req.DoRaw(testCtx)
+				Expect(logErr).NotTo(HaveOccurred(), "failed to get logs from pod %s", pod.Name)
+				logStr := string(rawLogs)
+
+				Expect(logStr).NotTo(ContainSubstring("no such host"),
+					"pod %s must not have DNS lookup failures", pod.Name)
+				Expect(logStr).NotTo(ContainSubstring("network unreachable"),
+					"pod %s must not have network unreachable errors", pod.Name)
+				Expect(logStr).NotTo(ContainSubstring("connection refused"),
+					"pod %s must not have connection refused errors", pod.Name)
+				Expect(logStr).NotTo(ContainSubstring("read-only file system"),
+					"pod %s must not have read-only filesystem errors", pod.Name)
+
+				fmt.Fprintf(GinkgoWriter, "pod '%s' logs clean — no DNS/network/filesystem errors\n", pod.Name)
+			}
+		})
+
+		It("SPIRE Agent root filesystem should reject writes and volume-backed paths should remain writable", Label("security-context"), func() {
+			By("Getting a SPIRE Agent pod for exec probes")
+			pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{LabelSelector: utils.SpireAgentPodLabel})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pods.Items).NotTo(BeEmpty(), "no SPIRE Agent pods found")
+			podName := pods.Items[0].Name
+
+			By("Probing root filesystem write rejection")
+			_, stderr, _ := utils.ExecInPod(testCtx, utils.OperatorNamespace, podName, "spire-agent",
+				[]string{"sh", "-c", "touch /.rofs-probe 2>&1; true"})
+			Expect(stderr).To(ContainSubstring("read-only file system"),
+				"container spire-agent root filesystem must reject writes")
+
+			By("Probing volume-backed writable path /var/lib/spire")
+			stdout, _, execErr := utils.ExecInPod(testCtx, utils.OperatorNamespace, podName, "spire-agent",
+				[]string{"ls", "/var/lib/spire"})
+			Expect(execErr).NotTo(HaveOccurred(),
+				"volume-backed write path /var/lib/spire must be accessible in container spire-agent")
+			_ = stdout
+
+			By("Probing volume-backed writable path /tmp/spire-agent/public")
+			stdout, _, execErr = utils.ExecInPod(testCtx, utils.OperatorNamespace, podName, "spire-agent",
+				[]string{"ls", "/tmp/spire-agent/public"})
+			Expect(execErr).NotTo(HaveOccurred(),
+				"volume-backed socket path /tmp/spire-agent/public must be accessible in container spire-agent")
+			_ = stdout
+
+			fmt.Fprintf(GinkgoWriter, "pod '%s' ReadOnlyRootFilesystem enforced; volume paths writable\n", podName)
+		})
+
+		It("SPIRE Agent container should not run as UID 0", Label("openshift-scc", "security-context"), func() {
+			By("Getting a SPIRE Agent pod for exec UID check")
+			pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{LabelSelector: utils.SpireAgentPodLabel})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pods.Items).NotTo(BeEmpty(), "no SPIRE Agent pods found")
+			podName := pods.Items[0].Name
+
+			By("Executing 'id -u' in the spire-agent container")
+			stdout, _, err := utils.ExecInPod(testCtx, utils.OperatorNamespace, podName, "spire-agent",
+				[]string{"id", "-u"})
+			if err != nil {
+				By("Falling back to /proc/self/status for UID check")
+				stdout, _, err = utils.ExecInPod(testCtx, utils.OperatorNamespace, podName, "spire-agent",
+					[]string{"sh", "-c", "cat /proc/self/status | grep ^Uid"})
+				Expect(err).NotTo(HaveOccurred(), "failed to read UID from /proc/self/status in pod %s", podName)
+				Expect(stdout).NotTo(ContainSubstring("Uid:\t0\t"),
+					"container spire-agent in pod %s must not run as UID 0; SCC RunAsAny defers to the image default", podName)
+			} else {
+				Expect(strings.TrimSpace(stdout)).NotTo(Equal("0"),
+					"container spire-agent in pod %s must not run as UID 0; SCC RunAsAny defers to the image default", podName)
+			}
+
+			fmt.Fprintf(GinkgoWriter, "pod '%s' spire-agent container UID: %s\n", podName, strings.TrimSpace(stdout))
+		})
+
+		It("SPIRE Agent SCC should reconcile back after drift (AllowHostNetwork set to true)", Label("openshift-scc", "reconciliation"), func() {
+			By("Fetching the spire-agent SCC")
+			scc := &securityv1.SecurityContextConstraints{}
+			Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, scc)).To(Succeed())
+
+			By("Mutating SCC AllowHostNetwork back to pre-PR value (true)")
+			scc.AllowHostNetwork = true
+			scc.AllowPrivilegedContainer = true
+			Expect(k8sClient.Update(testCtx, scc)).To(Succeed())
+			DeferCleanup(func(ctx context.Context) {
+				restored := &securityv1.SecurityContextConstraints{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: utils.SpireAgentSCCName}, restored); err == nil {
+					if restored.AllowHostNetwork || restored.AllowPrivilegedContainer {
+						restored.AllowHostNetwork = false
+						restored.AllowPrivilegedContainer = false
+						_ = k8sClient.Update(ctx, restored)
+					}
+				}
+			})
+
+			By("Waiting for the controller to reconcile the SCC back to hardened values")
+			Eventually(func(g Gomega) {
+				reconciled := &securityv1.SecurityContextConstraints{}
+				g.Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, reconciled)).To(Succeed())
+				g.Expect(reconciled.AllowHostNetwork).To(BeFalse(), "AllowHostNetwork must be reconciled back to false")
+				g.Expect(reconciled.AllowPrivilegedContainer).To(BeFalse(), "AllowPrivilegedContainer must be reconciled back to false")
+			}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(Succeed())
+
+			By("Verifying all SCC hardened fields are intact after drift correction")
+			final := &securityv1.SecurityContextConstraints{}
+			Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, final)).To(Succeed())
+			Expect(final.AllowHostPorts).To(BeFalse())
+			Expect(final.AllowPrivilegeEscalation).To(Equal(ptr.To(false)))
+			Expect(final.RequiredDropCapabilities).To(ContainElement(corev1.Capability("ALL")))
+			Expect(final.RunAsUser.Type).To(Equal(securityv1.RunAsUserStrategyRunAsAny))
+		})
+
+		It("SPIRE Agent DaemonSet should reconcile back after drift and pods should remain healthy", Label("security-context", "reconciliation"), func() {
+			By("Getting the spire-agent DaemonSet and recording generation")
+			ds, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentDaemonSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			initialGen := ds.Generation
+
+			By("Mutating DaemonSet PodSpec back to pre-PR values (HostNetwork: true, Privileged: true)")
+			ds.Spec.Template.Spec.HostNetwork = true
+			ds.Spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+			for i := range ds.Spec.Template.Spec.Containers {
+				if ds.Spec.Template.Spec.Containers[i].Name == "spire-agent" {
+					ds.Spec.Template.Spec.Containers[i].SecurityContext.Privileged = ptr.To(true)
+					ds.Spec.Template.Spec.Containers[i].SecurityContext.AllowPrivilegeEscalation = ptr.To(true)
+					break
+				}
+			}
+			_, err = clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Update(testCtx, ds, metav1.UpdateOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to mutate DaemonSet for drift test")
+
+			By("Waiting for the controller to reconcile the DaemonSet (generation bump)")
+			driftGen := initialGen + 1
+			utils.WaitForDaemonSetRollingUpdate(testCtx, clientset, utils.SpireAgentDaemonSetName, utils.OperatorNamespace, driftGen, utils.DefaultTimeout)
+
+			By("Waiting for DaemonSet to become Available after drift correction")
+			utils.WaitForDaemonSetAvailable(testCtx, clientset, utils.SpireAgentDaemonSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+			By("Sweeping container statuses for crash loops after drift correction rollout")
+			pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{LabelSelector: utils.SpireAgentPodLabel})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pods.Items).NotTo(BeEmpty(), "no SPIRE Agent pods found after drift correction")
+			for _, pod := range pods.Items {
+				for _, cs := range pod.Status.ContainerStatuses {
+					Expect(cs.State.Waiting).To(BeNil(),
+						"container %s in pod %s is in Waiting state after drift correction", cs.Name, pod.Name)
+					Expect(cs.RestartCount).To(BeNumerically("<", 3),
+						"container %s in pod %s restarted %d times after drift correction", cs.Name, pod.Name, cs.RestartCount)
+				}
+			}
+
+			By("Asserting reconciled DaemonSet PodSpec matches hardened configuration")
+			reconciledDS, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentDaemonSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reconciledDS.Spec.Template.Spec.HostNetwork).To(BeFalse(), "HostNetwork must be reconciled back to false")
+			Expect(reconciledDS.Spec.Template.Spec.DNSPolicy).To(Equal(corev1.DNSClusterFirst), "DNSPolicy must be reconciled back to ClusterFirst")
+			for _, c := range reconciledDS.Spec.Template.Spec.Containers {
+				if c.Name == "spire-agent" {
+					Expect(c.SecurityContext.Privileged).To(Equal(ptr.To(false)), "Privileged must be reconciled back to false")
+					Expect(c.SecurityContext.AllowPrivilegeEscalation).To(Equal(ptr.To(false)), "AllowPrivilegeEscalation must be reconciled back to false")
+					Expect(c.SecurityContext.ReadOnlyRootFilesystem).To(Equal(ptr.To(true)), "ReadOnlyRootFilesystem must remain true")
+					Expect(c.SecurityContext.Capabilities.Drop).To(ContainElement(corev1.Capability("ALL")), "Capabilities.Drop must contain ALL")
+				}
+			}
+			fmt.Fprintf(GinkgoWriter, "DaemonSet drift corrected and pods healthy after rolling update\n")
+		})
+
+		It("SPIRE Agent SCC should be recreated after deletion", Label("openshift-scc", "reconciliation"), func() {
+			By("Verifying the spire-agent SCC exists before deletion")
+			scc := &securityv1.SecurityContextConstraints{}
+			Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, scc)).To(Succeed())
+
+			By("Deleting the spire-agent SCC")
+			Expect(k8sClient.Delete(testCtx, scc)).To(Succeed())
+
+			By("Waiting for the controller to recreate the SCC")
+			Eventually(func(g Gomega) {
+				recreated := &securityv1.SecurityContextConstraints{}
+				g.Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireAgentSCCName}, recreated)).To(Succeed())
+				g.Expect(recreated.AllowHostNetwork).To(BeFalse(), "recreated SCC AllowHostNetwork must be false")
+				g.Expect(recreated.AllowPrivilegedContainer).To(BeFalse(), "recreated SCC AllowPrivilegedContainer must be false")
+				g.Expect(recreated.AllowPrivilegeEscalation).To(Equal(ptr.To(false)), "recreated SCC AllowPrivilegeEscalation must be false")
+				g.Expect(recreated.RunAsUser.Type).To(Equal(securityv1.RunAsUserStrategyRunAsAny), "recreated SCC RunAsUser.Type must be RunAsAny")
+				g.Expect(recreated.RequiredDropCapabilities).To(ContainElement(corev1.Capability("ALL")), "recreated SCC must drop ALL capabilities")
+			}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(Succeed())
+
+			fmt.Fprintf(GinkgoWriter, "SCC '%s' recreated by controller with correct hardened fields\n", utils.SpireAgentSCCName)
+		})
+	})
+
 	Context("CreateOnlyMode", func() {
 		It("should transition based on CREATE_ONLY_MODE env var value", func() {
 			By("Verifying CreateOnlyMode condition is not set by default")
@@ -1799,6 +2091,766 @@ var _ = Describe("Zero Trust Workload Identity Manager", Ordered, func() {
 				return !strings.Contains(cm.Data[utils.SpireServerConfigKey], driftMarker)
 			}).WithPolling(utils.ShortInterval).WithTimeout(utils.ShortTimeout).Should(BeTrue(),
 				"ConfigMap drift should be corrected when CreateOnlyMode is False")
+		})
+	})
+
+	Context("Federation", Ordered, func() {
+		It("Federation with https_spiffe profile should succeed", func() {
+			By("Creating SpireServer with https_spiffe federation profile")
+			server := &operatorv1alpha1.SpireServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "cluster",
+				},
+				Spec: operatorv1alpha1.SpireServerSpec{
+					LogLevel:            "info",
+					LogFormat:           "text",
+					JwtIssuer:           jwtIssuer,
+					CAValidity:          metav1.Duration{Duration: 24 * time.Hour},
+					DefaultX509Validity: metav1.Duration{Duration: 1 * time.Hour},
+					DefaultJWTValidity:  metav1.Duration{Duration: 5 * time.Minute},
+					CAKeyType:           "rsa-2048",
+					CASubject: operatorv1alpha1.CASubject{
+						CommonName:   "SPIRE Server CA",
+						Organization: "Test Org",
+						Country:      "US",
+					},
+					Datastore: operatorv1alpha1.DataStore{
+						DatabaseType:     "sqlite3",
+						ConnectionString: "/run/spire/data/datastore.sqlite3",
+						MaxOpenConns:     100,
+						MaxIdleConns:     2,
+					},
+					Persistence: operatorv1alpha1.Persistence{
+						Size:       "2Gi",
+						AccessMode: "ReadWriteOnce",
+					},
+					Federation: &operatorv1alpha1.FederationConfig{
+						BundleEndpoint: operatorv1alpha1.BundleEndpointConfig{
+							Profile:     operatorv1alpha1.HttpsSpiffeProfile,
+							RefreshHint: 300,
+						},
+						FederatesWith: []operatorv1alpha1.FederatesWithConfig{
+							{
+								TrustDomain:           "partner.example",
+								BundleEndpointUrl:     "https://partner.example:8443",
+								BundleEndpointProfile: operatorv1alpha1.HttpsSpiffeProfile,
+								EndpointSpiffeId:      "spiffe://partner.example/server",
+							},
+						},
+						ManagedRoute: "true",
+					},
+				},
+			}
+			err := k8sClient.Create(testCtx, server)
+			Expect(err).NotTo(HaveOccurred(), "failed to create SpireServer with federation")
+			DeferCleanup(func() {
+				err := k8sClient.Delete(testCtx, server)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to delete SpireServer: %v\n", err)
+				}
+			})
+
+			By("Waiting for SPIRE server StatefulSet to become Available")
+			utils.WaitForStatefulSetAvailable(testCtx, clientset, utils.SpireServerStatefulSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+			By("Verifying ConfigMap contains federation configuration")
+			err = utils.VerifyConfigMapFederationConfig(testCtx, k8sClient, utils.SpireServerConfigMapName, utils.OperatorNamespace, "0.0.0.0:8443")
+			Expect(err).NotTo(HaveOccurred(), "ConfigMap should contain valid federation configuration")
+
+			By("Verifying ConfigMap contains federates_with configuration")
+			cm := &corev1.ConfigMap{}
+			err = k8sClient.Get(testCtx, types.NamespacedName{Name: utils.SpireServerConfigMapName, Namespace: utils.OperatorNamespace}, cm)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm.Data["server.conf"]).To(ContainSubstring("partner.example"), "ConfigMap should contain partner.example trust domain")
+		})
+
+		It("Federation with https_web ServingCert profile should succeed", func() {
+			By("Creating TLS Secret for ServingCert profile")
+			federationDomain := "federation." + appDomain
+			err := utils.CreateTLSSecret(testCtx, k8sClient, "federation-tls-cert", utils.OperatorNamespace, federationDomain)
+			Expect(err).NotTo(HaveOccurred(), "failed to create TLS Secret")
+			DeferCleanup(func() {
+				secret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "federation-tls-cert",
+						Namespace: utils.OperatorNamespace,
+					},
+				}
+				err := k8sClient.Delete(testCtx, secret)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to delete TLS Secret: %v\n", err)
+				}
+			})
+
+			By("Creating SpireServer with https_web ServingCert federation profile")
+			server := &operatorv1alpha1.SpireServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "cluster",
+				},
+				Spec: operatorv1alpha1.SpireServerSpec{
+					LogLevel:            "info",
+					LogFormat:           "text",
+					JwtIssuer:           jwtIssuer,
+					CAValidity:          metav1.Duration{Duration: 24 * time.Hour},
+					DefaultX509Validity: metav1.Duration{Duration: 1 * time.Hour},
+					DefaultJWTValidity:  metav1.Duration{Duration: 5 * time.Minute},
+					CAKeyType:           "rsa-2048",
+					CASubject: operatorv1alpha1.CASubject{
+						CommonName:   "SPIRE Server CA",
+						Organization: "Test Org",
+						Country:      "US",
+					},
+					Datastore: operatorv1alpha1.DataStore{
+						DatabaseType:     "sqlite3",
+						ConnectionString: "/run/spire/data/datastore.sqlite3",
+						MaxOpenConns:     100,
+						MaxIdleConns:     2,
+					},
+					Persistence: operatorv1alpha1.Persistence{
+						Size:       "2Gi",
+						AccessMode: "ReadWriteOnce",
+					},
+					Federation: &operatorv1alpha1.FederationConfig{
+						BundleEndpoint: operatorv1alpha1.BundleEndpointConfig{
+							Profile:     operatorv1alpha1.HttpsWebProfile,
+							RefreshHint: 300,
+							HttpsWeb: &operatorv1alpha1.HttpsWebConfig{
+								ServingCert: &operatorv1alpha1.ServingCertConfig{
+									ExternalSecretRef: "federation-tls-cert",
+									FileSyncInterval:  3600,
+								},
+							},
+						},
+						ManagedRoute: "true",
+					},
+				},
+			}
+			err = k8sClient.Create(testCtx, server)
+			Expect(err).NotTo(HaveOccurred(), "failed to create SpireServer with https_web profile")
+			DeferCleanup(func() {
+				err := k8sClient.Delete(testCtx, server)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to delete SpireServer: %v\n", err)
+				}
+			})
+
+			By("Waiting for SPIRE server StatefulSet to become Available")
+			utils.WaitForStatefulSetAvailable(testCtx, clientset, utils.SpireServerStatefulSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+			By("Verifying ConfigMap contains https_web federation configuration")
+			err = utils.VerifyConfigMapFederationConfig(testCtx, k8sClient, utils.SpireServerConfigMapName, utils.OperatorNamespace, "0.0.0.0:8443")
+			Expect(err).NotTo(HaveOccurred(), "ConfigMap should contain valid federation configuration")
+
+			By("Verifying StatefulSet Pod has Secret volume mount")
+			sts, err := clientset.AppsV1().StatefulSets(utils.OperatorNamespace).Get(testCtx, utils.SpireServerStatefulSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			foundSecretVolume := false
+			for _, volume := range sts.Spec.Template.Spec.Volumes {
+				if volume.Secret != nil && volume.Secret.SecretName == "federation-tls-cert" {
+					foundSecretVolume = true
+					break
+				}
+			}
+			Expect(foundSecretVolume).To(BeTrue(), "StatefulSet should have Secret volume for TLS certificate")
+		})
+
+		It("managedRoute=true should create federation Route", func() {
+			By("Verifying federation Route was created")
+			utils.WaitForFederationRouteAvailable(testCtx, k8sClient, utils.FederationRouteName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+			By("Verifying Route configuration")
+			route := &routev1.Route{}
+			err := k8sClient.Get(testCtx, types.NamespacedName{Name: utils.FederationRouteName, Namespace: utils.OperatorNamespace}, route)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Route host matches federation domain pattern")
+			expectedHostPrefix := "federation."
+			Expect(route.Spec.Host).To(HavePrefix(expectedHostPrefix), "Route host should start with 'federation.'")
+
+			By("Verifying Route targets spire-server Service")
+			Expect(route.Spec.To.Name).To(Equal(utils.FederationServiceName), "Route should target spire-server Service")
+			Expect(route.Spec.To.Kind).To(Equal("Service"))
+
+			By("Verifying Route port configuration")
+			Expect(route.Spec.Port).NotTo(BeNil())
+			Expect(route.Spec.Port.TargetPort.String()).To(Equal("federation"), "Route should target federation named port")
+		})
+
+		It("managedRoute=false should not create federation Route", func() {
+			By("Deleting existing SpireServer to clean state")
+			server := &operatorv1alpha1.SpireServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "cluster",
+				},
+			}
+			err := k8sClient.Delete(testCtx, server)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Waiting for StatefulSet to be deleted")
+			Eventually(func() bool {
+				_, err := clientset.AppsV1().StatefulSets(utils.OperatorNamespace).Get(testCtx, utils.SpireServerStatefulSetName, metav1.GetOptions{})
+				return kerrors.IsNotFound(err)
+			}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue())
+
+			By("Creating SpireServer with managedRoute=false")
+			serverNoRoute := &operatorv1alpha1.SpireServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "cluster",
+				},
+				Spec: operatorv1alpha1.SpireServerSpec{
+					LogLevel:            "info",
+					LogFormat:           "text",
+					JwtIssuer:           jwtIssuer,
+					CAValidity:          metav1.Duration{Duration: 24 * time.Hour},
+					DefaultX509Validity: metav1.Duration{Duration: 1 * time.Hour},
+					DefaultJWTValidity:  metav1.Duration{Duration: 5 * time.Minute},
+					CAKeyType:           "rsa-2048",
+					CASubject: operatorv1alpha1.CASubject{
+						CommonName:   "SPIRE Server CA",
+						Organization: "Test Org",
+						Country:      "US",
+					},
+					Datastore: operatorv1alpha1.DataStore{
+						DatabaseType:     "sqlite3",
+						ConnectionString: "/run/spire/data/datastore.sqlite3",
+						MaxOpenConns:     100,
+						MaxIdleConns:     2,
+					},
+					Persistence: operatorv1alpha1.Persistence{
+						Size:       "2Gi",
+						AccessMode: "ReadWriteOnce",
+					},
+					Federation: &operatorv1alpha1.FederationConfig{
+						BundleEndpoint: operatorv1alpha1.BundleEndpointConfig{
+							Profile:     operatorv1alpha1.HttpsSpiffeProfile,
+							RefreshHint: 300,
+						},
+						ManagedRoute: "false",
+					},
+				},
+			}
+			err = k8sClient.Create(testCtx, serverNoRoute)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() {
+				err := k8sClient.Delete(testCtx, serverNoRoute)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to delete SpireServer: %v\n", err)
+				}
+			})
+
+			By("Waiting for SPIRE server StatefulSet to become Available")
+			utils.WaitForStatefulSetAvailable(testCtx, clientset, utils.SpireServerStatefulSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+			By("Verifying federation Route does not exist")
+			route := &routev1.Route{}
+			err = k8sClient.Get(testCtx, types.NamespacedName{Name: utils.FederationRouteName, Namespace: utils.OperatorNamespace}, route)
+			Expect(kerrors.IsNotFound(err)).To(BeTrue(), "Route should not exist when managedRoute=false")
+
+			By("Verifying Service still exposes federation port")
+			svc, err := clientset.CoreV1().Services(utils.OperatorNamespace).Get(testCtx, utils.FederationServiceName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			foundPort := false
+			for _, port := range svc.Spec.Ports {
+				if port.Port == utils.FederationServicePort {
+					foundPort = true
+					break
+				}
+			}
+			Expect(foundPort).To(BeTrue(), "Service should still expose port 8443 for federation")
+		})
+
+		It("Route TLS configuration should match bundle endpoint profile", func() {
+			By("Deleting existing SpireServer to clean state")
+			server := &operatorv1alpha1.SpireServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "cluster",
+				},
+			}
+			err := k8sClient.Delete(testCtx, server)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Waiting for StatefulSet to be deleted")
+			Eventually(func() bool {
+				_, err := clientset.AppsV1().StatefulSets(utils.OperatorNamespace).Get(testCtx, utils.SpireServerStatefulSetName, metav1.GetOptions{})
+				return kerrors.IsNotFound(err)
+			}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue())
+
+			By("Testing https_spiffe profile with Passthrough TLS")
+			serverSpiffe := &operatorv1alpha1.SpireServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "cluster",
+				},
+				Spec: operatorv1alpha1.SpireServerSpec{
+					LogLevel:            "info",
+					LogFormat:           "text",
+					JwtIssuer:           jwtIssuer,
+					CAValidity:          metav1.Duration{Duration: 24 * time.Hour},
+					DefaultX509Validity: metav1.Duration{Duration: 1 * time.Hour},
+					DefaultJWTValidity:  metav1.Duration{Duration: 5 * time.Minute},
+					CAKeyType:           "rsa-2048",
+					CASubject: operatorv1alpha1.CASubject{
+						CommonName:   "SPIRE Server CA",
+						Organization: "Test Org",
+						Country:      "US",
+					},
+					Datastore: operatorv1alpha1.DataStore{
+						DatabaseType:     "sqlite3",
+						ConnectionString: "/run/spire/data/datastore.sqlite3",
+						MaxOpenConns:     100,
+						MaxIdleConns:     2,
+					},
+					Persistence: operatorv1alpha1.Persistence{
+						Size:       "2Gi",
+						AccessMode: "ReadWriteOnce",
+					},
+					Federation: &operatorv1alpha1.FederationConfig{
+						BundleEndpoint: operatorv1alpha1.BundleEndpointConfig{
+							Profile:     operatorv1alpha1.HttpsSpiffeProfile,
+							RefreshHint: 300,
+						},
+						ManagedRoute: "true",
+					},
+				},
+			}
+			err = k8sClient.Create(testCtx, serverSpiffe)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() {
+				err := k8sClient.Delete(testCtx, serverSpiffe)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to delete SpireServer: %v\n", err)
+				}
+			})
+
+			By("Waiting for SPIRE server StatefulSet to become Available")
+			utils.WaitForStatefulSetAvailable(testCtx, clientset, utils.SpireServerStatefulSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+			By("Waiting for federation Route")
+			utils.WaitForFederationRouteAvailable(testCtx, k8sClient, utils.FederationRouteName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+			By("Verifying https_spiffe Route uses Passthrough TLS")
+			route := &routev1.Route{}
+			err = k8sClient.Get(testCtx, types.NamespacedName{Name: utils.FederationRouteName, Namespace: utils.OperatorNamespace}, route)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(route.Spec.TLS).NotTo(BeNil())
+			Expect(route.Spec.TLS.Termination).To(Equal(routev1.TLSTerminationPassthrough), "https_spiffe profile should use Passthrough TLS")
+
+			By("Deleting https_spiffe SpireServer")
+			err = k8sClient.Delete(testCtx, serverSpiffe)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Waiting for StatefulSet to be deleted")
+			Eventually(func() bool {
+				_, err := clientset.AppsV1().StatefulSets(utils.OperatorNamespace).Get(testCtx, utils.SpireServerStatefulSetName, metav1.GetOptions{})
+				return kerrors.IsNotFound(err)
+			}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue())
+
+			By("Creating TLS Secret for https_web test")
+			federationDomain := "federation." + appDomain
+			err = utils.CreateTLSSecret(testCtx, k8sClient, "federation-tls-cert-route-test", utils.OperatorNamespace, federationDomain)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() {
+				secret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "federation-tls-cert-route-test",
+						Namespace: utils.OperatorNamespace,
+					},
+				}
+				err := k8sClient.Delete(testCtx, secret)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to delete TLS Secret: %v\n", err)
+				}
+			})
+
+			By("Testing https_web ServingCert profile with Reencrypt TLS")
+			serverWeb := &operatorv1alpha1.SpireServer{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "cluster",
+				},
+				Spec: operatorv1alpha1.SpireServerSpec{
+					LogLevel:            "info",
+					LogFormat:           "text",
+					JwtIssuer:           jwtIssuer,
+					CAValidity:          metav1.Duration{Duration: 24 * time.Hour},
+					DefaultX509Validity: metav1.Duration{Duration: 1 * time.Hour},
+					DefaultJWTValidity:  metav1.Duration{Duration: 5 * time.Minute},
+					CAKeyType:           "rsa-2048",
+					CASubject: operatorv1alpha1.CASubject{
+						CommonName:   "SPIRE Server CA",
+						Organization: "Test Org",
+						Country:      "US",
+					},
+					Datastore: operatorv1alpha1.DataStore{
+						DatabaseType:     "sqlite3",
+						ConnectionString: "/run/spire/data/datastore.sqlite3",
+						MaxOpenConns:     100,
+						MaxIdleConns:     2,
+					},
+					Persistence: operatorv1alpha1.Persistence{
+						Size:       "2Gi",
+						AccessMode: "ReadWriteOnce",
+					},
+					Federation: &operatorv1alpha1.FederationConfig{
+						BundleEndpoint: operatorv1alpha1.BundleEndpointConfig{
+							Profile:     operatorv1alpha1.HttpsWebProfile,
+							RefreshHint: 300,
+							HttpsWeb: &operatorv1alpha1.HttpsWebConfig{
+								ServingCert: &operatorv1alpha1.ServingCertConfig{
+									ExternalSecretRef: "federation-tls-cert-route-test",
+									FileSyncInterval:  3600,
+								},
+							},
+						},
+						ManagedRoute: "true",
+					},
+				},
+			}
+			err = k8sClient.Create(testCtx, serverWeb)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() {
+				err := k8sClient.Delete(testCtx, serverWeb)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to delete SpireServer: %v\n", err)
+				}
+			})
+
+			By("Waiting for SPIRE server StatefulSet to become Available")
+			utils.WaitForStatefulSetAvailable(testCtx, clientset, utils.SpireServerStatefulSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+			By("Waiting for federation Route")
+			utils.WaitForFederationRouteAvailable(testCtx, k8sClient, utils.FederationRouteName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+			By("Verifying https_web ServingCert Route uses Reencrypt TLS with external certificate")
+			routeWeb := &routev1.Route{}
+			err = k8sClient.Get(testCtx, types.NamespacedName{Name: utils.FederationRouteName, Namespace: utils.OperatorNamespace}, routeWeb)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(routeWeb.Spec.TLS).NotTo(BeNil())
+			Expect(routeWeb.Spec.TLS.Termination).To(Equal(routev1.TLSTerminationReencrypt), "https_web ServingCert profile should use Reencrypt TLS")
+			Expect(routeWeb.Spec.TLS.ExternalCertificate).NotTo(BeNil(), "Route should reference external certificate")
+			Expect(routeWeb.Spec.TLS.ExternalCertificate.Name).To(Equal("federation-tls-cert-route-test"), "Route should reference correct Secret")
+		})
+
+		Context("ClusterFederatedTrustDomain", func() {
+			BeforeAll(func() {
+				By("Checking if spire-controller-manager is deployed")
+				_, err := clientset.AppsV1().Deployments(utils.OperatorNamespace).Get(context.Background(), "spire-controller-manager", metav1.GetOptions{})
+				if kerrors.IsNotFound(err) {
+					Skip("spire-controller-manager not deployed, skipping ClusterFederatedTrustDomain tests")
+				}
+				Expect(err).NotTo(HaveOccurred(), "failed to check spire-controller-manager deployment")
+
+				By("Waiting for spire-controller-manager to become Available")
+				utils.WaitForDeploymentAvailable(context.Background(), clientset, "spire-controller-manager", utils.OperatorNamespace, utils.DefaultTimeout)
+			})
+
+			It("ClusterFederatedTrustDomain CR should be created successfully", func() {
+				By("Ensuring SpireServer with federation exists")
+				server := &operatorv1alpha1.SpireServer{}
+				err := k8sClient.Get(testCtx, types.NamespacedName{Name: "cluster"}, server)
+				if kerrors.IsNotFound(err) {
+					By("Creating SpireServer with federation for ClusterFederatedTrustDomain tests")
+					serverForFed := &operatorv1alpha1.SpireServer{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "cluster",
+						},
+						Spec: operatorv1alpha1.SpireServerSpec{
+							LogLevel:            "info",
+							LogFormat:           "text",
+							JwtIssuer:           jwtIssuer,
+							CAValidity:          metav1.Duration{Duration: 24 * time.Hour},
+							DefaultX509Validity: metav1.Duration{Duration: 1 * time.Hour},
+							DefaultJWTValidity:  metav1.Duration{Duration: 5 * time.Minute},
+							CAKeyType:           "rsa-2048",
+							CASubject: operatorv1alpha1.CASubject{
+								CommonName:   "SPIRE Server CA",
+								Organization: "Test Org",
+								Country:      "US",
+							},
+							Datastore: operatorv1alpha1.DataStore{
+								DatabaseType:     "sqlite3",
+								ConnectionString: "/run/spire/data/datastore.sqlite3",
+								MaxOpenConns:     100,
+								MaxIdleConns:     2,
+							},
+							Persistence: operatorv1alpha1.Persistence{
+								Size:       "2Gi",
+								AccessMode: "ReadWriteOnce",
+							},
+							Federation: &operatorv1alpha1.FederationConfig{
+								BundleEndpoint: operatorv1alpha1.BundleEndpointConfig{
+									Profile:     operatorv1alpha1.HttpsSpiffeProfile,
+									RefreshHint: 300,
+								},
+								ManagedRoute: "true",
+							},
+						},
+					}
+					err = k8sClient.Create(testCtx, serverForFed)
+					Expect(err).NotTo(HaveOccurred())
+					utils.WaitForStatefulSetAvailable(testCtx, clientset, utils.SpireServerStatefulSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+				} else {
+					Expect(err).NotTo(HaveOccurred())
+				}
+
+				By("Creating ClusterFederatedTrustDomain CR")
+				federatedTrustDomain := &spiffev1alpha1.ClusterFederatedTrustDomain{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "partner-example",
+					},
+					Spec: spiffev1alpha1.ClusterFederatedTrustDomainSpec{
+						TrustDomain:           "partner.example",
+						BundleEndpointProfile: spiffev1alpha1.BundleEndpointProfileHTTPSWeb,
+						BundleEndpointURL:     "https://partner.example:8443",
+					},
+				}
+				err = k8sClient.Create(testCtx, federatedTrustDomain)
+				Expect(err).NotTo(HaveOccurred(), "failed to create ClusterFederatedTrustDomain")
+				DeferCleanup(func() {
+					err := k8sClient.Delete(testCtx, federatedTrustDomain)
+					if err != nil {
+						fmt.Fprintf(GinkgoWriter, "failed to delete ClusterFederatedTrustDomain: %v\n", err)
+					}
+				})
+
+				By("Verifying ClusterFederatedTrustDomain CR exists")
+				ftd := &spiffev1alpha1.ClusterFederatedTrustDomain{}
+				err = k8sClient.Get(testCtx, types.NamespacedName{Name: "partner-example"}, ftd)
+				Expect(err).NotTo(HaveOccurred(), "ClusterFederatedTrustDomain should exist")
+				Expect(ftd.Spec.TrustDomain).To(Equal("partner.example"))
+			})
+
+			It("ClusterSPIFFEID with federatesWith should configure workload SVID", func() {
+				By("Creating ClusterSPIFFEID with federatesWith")
+				spiffeID := &spiffev1alpha1.ClusterSPIFFEID{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "test-workload-federation",
+					},
+					Spec: spiffev1alpha1.ClusterSPIFFEIDSpec{
+						SpiffeIDTemplate: "spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}",
+						PodSelector: metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								"test-federation": "true",
+							},
+						},
+						FederatesWith: []string{"partner.example"},
+					},
+				}
+				err := k8sClient.Create(testCtx, spiffeID)
+				Expect(err).NotTo(HaveOccurred(), "failed to create ClusterSPIFFEID")
+				DeferCleanup(func() {
+					err := k8sClient.Delete(testCtx, spiffeID)
+					if err != nil {
+						fmt.Fprintf(GinkgoWriter, "failed to delete ClusterSPIFFEID: %v\n", err)
+					}
+				})
+
+				By("Creating test workload Pod matching ClusterSPIFFEID selector")
+				testPod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-federation-workload",
+						Namespace: utils.OperatorNamespace,
+						Labels: map[string]string{
+							"test-federation": "true",
+						},
+					},
+					Spec: corev1.PodSpec{
+						ServiceAccountName: "default",
+						Containers: []corev1.Container{
+							{
+								Name:    "test-container",
+								Image:   "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+								Command: []string{"/bin/sh", "-c", "sleep 3600"},
+								VolumeMounts: []corev1.VolumeMount{
+									{
+										Name:      "spiffe-workload-api",
+										MountPath: "/spiffe-workload-api",
+										ReadOnly:  true,
+									},
+								},
+							},
+						},
+						Volumes: []corev1.Volume{
+							{
+								Name: "spiffe-workload-api",
+								VolumeSource: corev1.VolumeSource{
+									CSI: &corev1.CSIVolumeSource{
+										Driver:   "csi.spiffe.io",
+										ReadOnly: ptr.To(true),
+									},
+								},
+							},
+						},
+					},
+				}
+				err = k8sClient.Create(testCtx, testPod)
+				Expect(err).NotTo(HaveOccurred(), "failed to create test Pod")
+				DeferCleanup(func() {
+					err := k8sClient.Delete(testCtx, testPod)
+					if err != nil {
+						fmt.Fprintf(GinkgoWriter, "failed to delete test Pod: %v\n", err)
+					}
+				})
+
+				By("Waiting for test Pod to be Running")
+				Eventually(func() bool {
+					pod := &corev1.Pod{}
+					err := k8sClient.Get(testCtx, types.NamespacedName{Name: "test-federation-workload", Namespace: utils.OperatorNamespace}, pod)
+					if err != nil {
+						fmt.Fprintf(GinkgoWriter, "failed to get Pod: %v\n", err)
+						return false
+					}
+					if pod.Status.Phase != corev1.PodRunning {
+						fmt.Fprintf(GinkgoWriter, "Pod phase: %s\n", pod.Status.Phase)
+						return false
+					}
+					fmt.Fprintf(GinkgoWriter, "Pod is Running\n")
+					return true
+				}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue())
+
+				By("Verifying SPIFFE CSI driver socket exists in Pod")
+				pod := &corev1.Pod{}
+				err = k8sClient.Get(testCtx, types.NamespacedName{Name: "test-federation-workload", Namespace: utils.OperatorNamespace}, pod)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(pod.Spec.Volumes).To(ContainElement(
+					MatchFields(IgnoreExtras, Fields{
+						"Name": Equal("spiffe-workload-api"),
+						"VolumeSource": MatchFields(IgnoreExtras, Fields{
+							"CSI": PointTo(MatchFields(IgnoreExtras, Fields{
+								"Driver": Equal("csi.spiffe.io"),
+							})),
+						}),
+					}),
+				), "Pod should have SPIFFE CSI volume configured")
+			})
+		})
+
+		Context("Immutability and Validation", func() {
+			It("Federation configuration cannot be removed once set", func() {
+				By("Getting existing SpireServer with federation")
+				server := &operatorv1alpha1.SpireServer{}
+				err := k8sClient.Get(testCtx, types.NamespacedName{Name: "cluster"}, server)
+				Expect(err).NotTo(HaveOccurred())
+
+				if server.Spec.Federation == nil {
+					Skip("SpireServer does not have federation configured, skipping immutability test")
+				}
+
+				By("Attempting to remove federation configuration")
+				serverCopy := server.DeepCopy()
+				serverCopy.Spec.Federation = nil
+
+				err = k8sClient.Update(testCtx, serverCopy)
+				Expect(err).To(HaveOccurred(), "Update should fail when removing federation")
+				Expect(kerrors.IsInvalid(err)).To(BeTrue(), "Error should be validation error")
+				Expect(err.Error()).To(ContainSubstring("Federation configuration cannot be removed once set"), "Error should mention federation removal")
+			})
+
+			It("Bundle endpoint profile is immutable", func() {
+				By("Getting existing SpireServer with https_spiffe profile")
+				server := &operatorv1alpha1.SpireServer{}
+				err := k8sClient.Get(testCtx, types.NamespacedName{Name: "cluster"}, server)
+				Expect(err).NotTo(HaveOccurred())
+
+				if server.Spec.Federation == nil {
+					Skip("SpireServer does not have federation configured, skipping immutability test")
+				}
+
+				originalProfile := server.Spec.Federation.BundleEndpoint.Profile
+
+				By("Attempting to change bundle endpoint profile")
+				serverCopy := server.DeepCopy()
+				if originalProfile == operatorv1alpha1.HttpsSpiffeProfile {
+					serverCopy.Spec.Federation.BundleEndpoint.Profile = operatorv1alpha1.HttpsWebProfile
+				} else {
+					serverCopy.Spec.Federation.BundleEndpoint.Profile = operatorv1alpha1.HttpsSpiffeProfile
+				}
+
+				err = k8sClient.Update(testCtx, serverCopy)
+				Expect(err).To(HaveOccurred(), "Update should fail when changing profile")
+				Expect(kerrors.IsInvalid(err)).To(BeTrue(), "Error should be validation error")
+				Expect(err.Error()).To(ContainSubstring("profile is immutable"), "Error should mention profile immutability")
+			})
+
+			It("Cannot switch between ACME and ServingCert configuration", func() {
+				By("Getting existing SpireServer")
+				server := &operatorv1alpha1.SpireServer{}
+				err := k8sClient.Get(testCtx, types.NamespacedName{Name: "cluster"}, server)
+				Expect(err).NotTo(HaveOccurred())
+
+				if server.Spec.Federation == nil || server.Spec.Federation.BundleEndpoint.Profile != operatorv1alpha1.HttpsWebProfile {
+					Skip("SpireServer does not have https_web profile configured, skipping ACME/ServingCert switch test")
+				}
+
+				if server.Spec.Federation.BundleEndpoint.HttpsWeb == nil || server.Spec.Federation.BundleEndpoint.HttpsWeb.ServingCert == nil {
+					Skip("SpireServer does not have ServingCert configured, skipping switch test")
+				}
+
+				By("Attempting to switch from ServingCert to ACME")
+				serverCopy := server.DeepCopy()
+				serverCopy.Spec.Federation.BundleEndpoint.HttpsWeb.ServingCert = nil
+				serverCopy.Spec.Federation.BundleEndpoint.HttpsWeb.Acme = &operatorv1alpha1.AcmeConfig{
+					DirectoryUrl: "https://acme-staging.example.com/directory",
+					DomainName:   "test.example",
+					Email:        "test@example.com",
+					TosAccepted:  "true",
+				}
+
+				err = k8sClient.Update(testCtx, serverCopy)
+				Expect(err).To(HaveOccurred(), "Update should fail when switching from ServingCert to ACME")
+				Expect(kerrors.IsInvalid(err)).To(BeTrue(), "Error should be validation error")
+				Expect(err.Error()).To(ContainSubstring("cannot switch from servingCert to acme"), "Error should mention ServingCert to ACME switch")
+			})
+
+			It("https_spiffe profile requires endpointSpiffeId in federatesWith", func() {
+				By("Attempting to create SpireServer with https_spiffe federatesWith missing endpointSpiffeId")
+				serverInvalid := &operatorv1alpha1.SpireServer{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "cluster-invalid",
+					},
+					Spec: operatorv1alpha1.SpireServerSpec{
+						LogLevel:            "info",
+						LogFormat:           "text",
+						JwtIssuer:           jwtIssuer,
+						CAValidity:          metav1.Duration{Duration: 24 * time.Hour},
+						DefaultX509Validity: metav1.Duration{Duration: 1 * time.Hour},
+						DefaultJWTValidity:  metav1.Duration{Duration: 5 * time.Minute},
+						CAKeyType:           "rsa-2048",
+						CASubject: operatorv1alpha1.CASubject{
+							CommonName:   "SPIRE Server CA",
+							Organization: "Test Org",
+							Country:      "US",
+						},
+						Datastore: operatorv1alpha1.DataStore{
+							DatabaseType:     "sqlite3",
+							ConnectionString: "/run/spire/data/datastore.sqlite3",
+							MaxOpenConns:     100,
+							MaxIdleConns:     2,
+						},
+						Persistence: operatorv1alpha1.Persistence{
+							Size:       "2Gi",
+							AccessMode: "ReadWriteOnce",
+						},
+						Federation: &operatorv1alpha1.FederationConfig{
+							BundleEndpoint: operatorv1alpha1.BundleEndpointConfig{
+								Profile:     operatorv1alpha1.HttpsSpiffeProfile,
+								RefreshHint: 300,
+							},
+							FederatesWith: []operatorv1alpha1.FederatesWithConfig{
+								{
+									TrustDomain:           "invalid.example",
+									BundleEndpointUrl:     "https://invalid.example:8443",
+									BundleEndpointProfile: operatorv1alpha1.HttpsSpiffeProfile,
+									EndpointSpiffeId:      "", // Missing required field
+								},
+							},
+						},
+					},
+				}
+
+				err := k8sClient.Create(testCtx, serverInvalid)
+				Expect(err).To(HaveOccurred(), "Create should fail when endpointSpiffeId is missing for https_spiffe")
+				Expect(kerrors.IsInvalid(err)).To(BeTrue(), "Error should be validation error")
+				Expect(err.Error()).To(ContainSubstring("endpointSpiffeId is required when bundleEndpointProfile is https_spiffe"), "Error should mention missing endpointSpiffeId")
+			})
 		})
 	})
 })

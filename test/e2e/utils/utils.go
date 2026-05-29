@@ -19,8 +19,14 @@ package utils
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"strings"
@@ -28,6 +34,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	routev1 "github.com/openshift/api/route/v1"
 	configv1 "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
 	operatorv1alpha1 "github.com/openshift/zero-trust-workload-identity-manager/api/v1alpha1"
 	operatorv1 "github.com/operator-framework/api/pkg/operators/v1"
@@ -860,4 +867,124 @@ func WaitForUpgradeableStatus(ctx context.Context, k8sClient client.Client, name
 		return true
 	}).WithTimeout(timeout).WithPolling(ShortInterval).Should(BeTrue(),
 		"Upgradeable condition should have status '%v' within %v", expectedStatus, timeout)
+}
+
+// CreateTLSSecret creates a Kubernetes Secret with a self-signed TLS certificate
+// for testing https_web ServingCert profile.
+func CreateTLSSecret(ctx context.Context, k8sClient client.Client, name, namespace, domain string) error {
+	// Generate private key
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return fmt.Errorf("failed to generate private key: %w", err)
+	}
+
+	// Create certificate template
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: domain,
+		},
+		DNSNames:              []string{domain},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	// Create self-signed certificate
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return fmt.Errorf("failed to create certificate: %w", err)
+	}
+
+	// Encode certificate to PEM
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certDER,
+	})
+
+	// Encode private key to PEM
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	})
+
+	// Create Secret
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			"tls.crt": certPEM,
+			"tls.key": keyPEM,
+		},
+	}
+
+	if err := k8sClient.Create(ctx, secret); err != nil {
+		return fmt.Errorf("failed to create Secret: %w", err)
+	}
+
+	fmt.Fprintf(GinkgoWriter, "Created TLS Secret '%s' in namespace '%s' for domain '%s'\n", name, namespace, domain)
+	return nil
+}
+
+// WaitForFederationRouteAvailable waits for an OpenShift Route to become Admitted within timeout.
+func WaitForFederationRouteAvailable(ctx context.Context, k8sClient client.Client, name, namespace string, timeout time.Duration) {
+	Eventually(func() bool {
+		route := &routev1.Route{}
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, route); err != nil {
+			fmt.Fprintf(GinkgoWriter, "failed to get Route '%s/%s': %v\n", namespace, name, err)
+			return false
+		}
+
+		// Check if Route is admitted
+		if len(route.Status.Ingress) == 0 {
+			fmt.Fprintf(GinkgoWriter, "Route '%s/%s' has no ingress status yet\n", namespace, name)
+			return false
+		}
+
+		for _, condition := range route.Status.Ingress[0].Conditions {
+			if condition.Type == routev1.RouteAdmitted && condition.Status == corev1.ConditionTrue {
+				fmt.Fprintf(GinkgoWriter, "Route '%s/%s' is admitted (host: %s)\n", namespace, name, route.Status.Ingress[0].Host)
+				return true
+			}
+		}
+
+		fmt.Fprintf(GinkgoWriter, "Route '%s/%s' not admitted yet\n", namespace, name)
+		return false
+	}).WithTimeout(timeout).WithPolling(DefaultInterval).Should(BeTrue(),
+		"Route '%s/%s' should become admitted within %v", namespace, name, timeout)
+}
+
+// VerifyConfigMapFederationConfig retrieves a ConfigMap and verifies it contains federation configuration.
+func VerifyConfigMapFederationConfig(ctx context.Context, k8sClient client.Client, cmName, namespace string, expectedBundleEndpointAddress string) error {
+	cm := &corev1.ConfigMap{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: cmName, Namespace: namespace}, cm); err != nil {
+		return fmt.Errorf("failed to get ConfigMap '%s/%s': %w", namespace, cmName, err)
+	}
+
+	serverConf, ok := cm.Data["server.conf"]
+	if !ok {
+		return fmt.Errorf("ConfigMap '%s/%s' does not contain 'server.conf' key", namespace, cmName)
+	}
+
+	// Verify federation section exists
+	if !strings.Contains(serverConf, "federation") {
+		return fmt.Errorf("server.conf does not contain 'federation' section")
+	}
+
+	// Verify bundle_endpoint exists with expected address
+	if !strings.Contains(serverConf, "bundle_endpoint") {
+		return fmt.Errorf("server.conf does not contain 'bundle_endpoint' configuration")
+	}
+
+	if expectedBundleEndpointAddress != "" && !strings.Contains(serverConf, expectedBundleEndpointAddress) {
+		return fmt.Errorf("server.conf bundle_endpoint does not contain expected address '%s'", expectedBundleEndpointAddress)
+	}
+
+	fmt.Fprintf(GinkgoWriter, "ConfigMap '%s/%s' contains valid federation configuration\n", namespace, cmName)
+	return nil
 }

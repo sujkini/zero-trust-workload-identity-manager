@@ -45,9 +45,16 @@ const (
 	SpiffeHelperContainerName = "spiffe-helper"
 	SpiffeHelperImage         = "ghcr.io/spiffe/spiffe-helper:0.11.0"
 
-	DefaultInterval = 10 * time.Second
-	ShortInterval   = 5 * time.Second
-	DefaultTimeout  = 5 * time.Minute
-	ShortTimeout    = 2 * time.Minute
+	SpireAgentSCCName = "spire-agent"
+
+	// Federation endpoint constants
+	FederationServicePort = 8443
+	FederationRouteName   = "spire-server-federation"
+	FederationServiceName = "spire-server"
+
+	DefaultInterval    = 10 * time.Second
+	ShortInterval      = 5 * time.Second
+	DefaultTimeout     = 5 * time.Minute
+	ShortTimeout       = 2 * time.Minute
 	TestContextTimeout = 10 * time.Minute
 )
