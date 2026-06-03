@@ -1661,6 +1661,367 @@ var _ = Describe("Zero Trust Workload Identity Manager", Ordered, func() {
 		})
 	})
 
+	Context("Resource conflict detection", func() {
+		It("SpireServer should detect conflict when managed-by label is removed from ConfigMap and recover after restoration", func() {
+			By("Verifying SpireServer ConfigMap exists with managed-by label")
+			cm := &corev1.ConfigMap{}
+			err := k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireServerConfigMapName,
+				Namespace: utils.OperatorNamespace,
+			}, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpireServer ConfigMap")
+			Expect(cm.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"ConfigMap should have managed-by label")
+
+			By("Removing managed-by label from ConfigMap to trigger conflict detection")
+			err = utils.RemoveManagedByLabel(testCtx, k8sClient, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from ConfigMap")
+			DeferCleanup(func(ctx context.Context) {
+				By("Ensuring managed-by label is restored on SpireServer ConfigMap")
+				restoreCM := &corev1.ConfigMap{}
+				if getErr := k8sClient.Get(ctx, client.ObjectKey{
+					Name:      utils.SpireServerConfigMapName,
+					Namespace: utils.OperatorNamespace,
+				}, restoreCM); getErr == nil {
+					if restoreCM.Labels == nil || restoreCM.Labels[utils.AppManagedByLabelKey] != utils.AppManagedByLabelValue {
+						utils.RestoreManagedByLabel(ctx, k8sClient, restoreCM)
+					}
+				}
+			})
+
+			By("Waiting for SpireServer ServerConfigMapAvailable condition to become False with ResourceConflict")
+			utils.WaitForConditionReason(testCtx, k8sClient, "cluster",
+				utils.GetSpireServerConditions,
+				"ServerConfigMapAvailable", metav1.ConditionFalse, "ResourceConflict",
+				utils.DefaultTimeout)
+
+			By("Restoring managed-by label on ConfigMap")
+			err = k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireServerConfigMapName,
+				Namespace: utils.OperatorNamespace,
+			}, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to re-fetch ConfigMap for label restoration")
+			err = utils.RestoreManagedByLabel(testCtx, k8sClient, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to restore managed-by label on ConfigMap")
+
+			By("Waiting for SpireServer to recover - ServerConfigMapAvailable becomes True")
+			utils.WaitForSpireServerConditions(testCtx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+				"ServerConfigMapAvailable": metav1.ConditionTrue,
+				"Ready":                    metav1.ConditionTrue,
+			}, utils.DefaultTimeout)
+		})
+
+		It("SpireAgent should detect conflict when managed-by label is removed from Service and recover after restoration", func() {
+			By("Verifying SpireAgent Service exists with managed-by label")
+			svc := &corev1.Service{}
+			err := k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireAgentServiceName,
+				Namespace: utils.OperatorNamespace,
+			}, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpireAgent Service")
+			Expect(svc.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"Service should have managed-by label")
+
+			By("Removing managed-by label from Service")
+			err = utils.RemoveManagedByLabel(testCtx, k8sClient, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from Service")
+			DeferCleanup(func(ctx context.Context) {
+				By("Ensuring managed-by label is restored on SpireAgent Service")
+				restoreSvc := &corev1.Service{}
+				if getErr := k8sClient.Get(ctx, client.ObjectKey{
+					Name:      utils.SpireAgentServiceName,
+					Namespace: utils.OperatorNamespace,
+				}, restoreSvc); getErr == nil {
+					if restoreSvc.Labels == nil || restoreSvc.Labels[utils.AppManagedByLabelKey] != utils.AppManagedByLabelValue {
+						utils.RestoreManagedByLabel(ctx, k8sClient, restoreSvc)
+					}
+				}
+			})
+
+			By("Waiting for SpireAgent ServiceAvailable condition to become False with ResourceConflict")
+			utils.WaitForConditionReason(testCtx, k8sClient, "cluster",
+				utils.GetSpireAgentConditions,
+				"ServiceAvailable", metav1.ConditionFalse, "ResourceConflict",
+				utils.DefaultTimeout)
+
+			By("Restoring managed-by label on Service")
+			err = k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireAgentServiceName,
+				Namespace: utils.OperatorNamespace,
+			}, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to re-fetch Service for label restoration")
+			err = utils.RestoreManagedByLabel(testCtx, k8sClient, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to restore managed-by label on Service")
+
+			By("Waiting for SpireAgent to recover - ServiceAvailable becomes True")
+			utils.WaitForSpireAgentConditions(testCtx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+				"ServiceAvailable": metav1.ConditionTrue,
+				"Ready":            metav1.ConditionTrue,
+			}, utils.DefaultTimeout)
+		})
+
+		It("SpiffeCSIDriver should detect conflict when managed-by label is removed from ServiceAccount and recover", func() {
+			By("Verifying SpiffeCSIDriver ServiceAccount exists with managed-by label")
+			sa := &corev1.ServiceAccount{}
+			err := k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpiffeCSIDriverServiceAccountName,
+				Namespace: utils.OperatorNamespace,
+			}, sa)
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpiffeCSIDriver ServiceAccount")
+			Expect(sa.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"ServiceAccount should have managed-by label")
+
+			By("Removing managed-by label from ServiceAccount")
+			err = utils.RemoveManagedByLabel(testCtx, k8sClient, sa)
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from ServiceAccount")
+			DeferCleanup(func(ctx context.Context) {
+				By("Ensuring managed-by label is restored on SpiffeCSIDriver ServiceAccount")
+				restoreSA := &corev1.ServiceAccount{}
+				if getErr := k8sClient.Get(ctx, client.ObjectKey{
+					Name:      utils.SpiffeCSIDriverServiceAccountName,
+					Namespace: utils.OperatorNamespace,
+				}, restoreSA); getErr == nil {
+					if restoreSA.Labels == nil || restoreSA.Labels[utils.AppManagedByLabelKey] != utils.AppManagedByLabelValue {
+						utils.RestoreManagedByLabel(ctx, k8sClient, restoreSA)
+					}
+				}
+			})
+
+			By("Waiting for SpiffeCSIDriver ServiceAccountAvailable condition to become False with ResourceConflict")
+			utils.WaitForConditionReason(testCtx, k8sClient, "cluster",
+				utils.GetSpiffeCSIDriverConditions,
+				"ServiceAccountAvailable", metav1.ConditionFalse, "ResourceConflict",
+				utils.DefaultTimeout)
+
+			By("Restoring managed-by label on ServiceAccount")
+			err = k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpiffeCSIDriverServiceAccountName,
+				Namespace: utils.OperatorNamespace,
+			}, sa)
+			Expect(err).NotTo(HaveOccurred(), "failed to re-fetch ServiceAccount for label restoration")
+			err = utils.RestoreManagedByLabel(testCtx, k8sClient, sa)
+			Expect(err).NotTo(HaveOccurred(), "failed to restore managed-by label on ServiceAccount")
+
+			By("Waiting for SpiffeCSIDriver to recover")
+			utils.WaitForSpiffeCSIDriverConditions(testCtx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+				"ServiceAccountAvailable": metav1.ConditionTrue,
+				"Ready":                   metav1.ConditionTrue,
+			}, utils.DefaultTimeout)
+		})
+
+		It("SpireOIDCDiscoveryProvider should detect conflict when managed-by label is removed from Service and recover", func() {
+			By("Verifying SpireOIDCDiscoveryProvider Service exists with managed-by label")
+			svc := &corev1.Service{}
+			err := k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireOIDCDiscoveryProviderServiceName,
+				Namespace: utils.OperatorNamespace,
+			}, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpireOIDCDiscoveryProvider Service")
+			Expect(svc.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"Service should have managed-by label")
+
+			By("Removing managed-by label from Service")
+			err = utils.RemoveManagedByLabel(testCtx, k8sClient, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from Service")
+			DeferCleanup(func(ctx context.Context) {
+				By("Ensuring managed-by label is restored on SpireOIDCDiscoveryProvider Service")
+				restoreSvc := &corev1.Service{}
+				if getErr := k8sClient.Get(ctx, client.ObjectKey{
+					Name:      utils.SpireOIDCDiscoveryProviderServiceName,
+					Namespace: utils.OperatorNamespace,
+				}, restoreSvc); getErr == nil {
+					if restoreSvc.Labels == nil || restoreSvc.Labels[utils.AppManagedByLabelKey] != utils.AppManagedByLabelValue {
+						utils.RestoreManagedByLabel(ctx, k8sClient, restoreSvc)
+					}
+				}
+			})
+
+			By("Waiting for SpireOIDCDiscoveryProvider ServiceAvailable condition to become False with ResourceConflict")
+			utils.WaitForConditionReason(testCtx, k8sClient, "cluster",
+				utils.GetSpireOIDCDiscoveryProviderConditions,
+				"ServiceAvailable", metav1.ConditionFalse, "ResourceConflict",
+				utils.DefaultTimeout)
+
+			By("Restoring managed-by label on Service")
+			err = k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireOIDCDiscoveryProviderServiceName,
+				Namespace: utils.OperatorNamespace,
+			}, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to re-fetch Service for label restoration")
+			err = utils.RestoreManagedByLabel(testCtx, k8sClient, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to restore managed-by label on Service")
+
+			By("Waiting for SpireOIDCDiscoveryProvider to recover")
+			utils.WaitForSpireOIDCDiscoveryProviderConditions(testCtx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+				"ServiceAvailable": metav1.ConditionTrue,
+				"Ready":            metav1.ConditionTrue,
+			}, utils.DefaultTimeout)
+		})
+
+		It("Operator should preserve conflict detection after pod restart", func() {
+			By("Removing managed-by label from SpireServer ConfigMap")
+			cm := &corev1.ConfigMap{}
+			err := k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireServerConfigMapName,
+				Namespace: utils.OperatorNamespace,
+			}, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpireServer ConfigMap")
+
+			err = utils.RemoveManagedByLabel(testCtx, k8sClient, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from ConfigMap")
+			DeferCleanup(func(ctx context.Context) {
+				By("Ensuring managed-by label is restored on SpireServer ConfigMap after pod restart test")
+				restoreCM := &corev1.ConfigMap{}
+				if getErr := k8sClient.Get(ctx, client.ObjectKey{
+					Name:      utils.SpireServerConfigMapName,
+					Namespace: utils.OperatorNamespace,
+				}, restoreCM); getErr == nil {
+					if restoreCM.Labels == nil || restoreCM.Labels[utils.AppManagedByLabelKey] != utils.AppManagedByLabelValue {
+						utils.RestoreManagedByLabel(ctx, k8sClient, restoreCM)
+					}
+				}
+				utils.WaitForSpireServerConditions(ctx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+					"ServerConfigMapAvailable": metav1.ConditionTrue,
+					"Ready":                    metav1.ConditionTrue,
+				}, utils.DefaultTimeout)
+			})
+
+			By("Waiting for conflict to be detected before restart")
+			utils.WaitForConditionReason(testCtx, k8sClient, "cluster",
+				utils.GetSpireServerConditions,
+				"ServerConfigMapAvailable", metav1.ConditionFalse, "ResourceConflict",
+				utils.DefaultTimeout)
+
+			By("Deleting operator pod to simulate restart")
+			err = clientset.CoreV1().Pods(utils.OperatorNamespace).DeleteCollection(testCtx, metav1.DeleteOptions{}, metav1.ListOptions{
+				LabelSelector: utils.OperatorLabelSelector,
+			})
+			Expect(err).NotTo(HaveOccurred(), "failed to delete operator pods")
+
+			By("Waiting for new operator pod to be Running")
+			utils.WaitForDeploymentAvailable(testCtx, clientset, utils.OperatorDeploymentName, utils.OperatorNamespace, utils.DefaultTimeout)
+
+			By("Verifying conflict persists after operator restart")
+			utils.WaitForConditionReason(testCtx, k8sClient, "cluster",
+				utils.GetSpireServerConditions,
+				"ServerConfigMapAvailable", metav1.ConditionFalse, "ResourceConflict",
+				utils.DefaultTimeout)
+
+			By("Restoring managed-by label to verify recovery after restart")
+			err = k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireServerConfigMapName,
+				Namespace: utils.OperatorNamespace,
+			}, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to re-fetch ConfigMap")
+			err = utils.RestoreManagedByLabel(testCtx, k8sClient, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to restore managed-by label")
+
+			By("Waiting for full recovery after restart")
+			utils.WaitForSpireServerConditions(testCtx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+				"ServerConfigMapAvailable": metav1.ConditionTrue,
+				"Ready":                    metav1.ConditionTrue,
+			}, utils.DefaultTimeout)
+		})
+
+		It("Multiple simultaneous resource conflicts across controllers should be detected independently", func() {
+			By("Removing managed-by label from SpireServer ConfigMap")
+			cm := &corev1.ConfigMap{}
+			err := k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireServerConfigMapName,
+				Namespace: utils.OperatorNamespace,
+			}, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpireServer ConfigMap")
+
+			err = utils.RemoveManagedByLabel(testCtx, k8sClient, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from SpireServer ConfigMap")
+			DeferCleanup(func(ctx context.Context) {
+				By("Restoring managed-by label on SpireServer ConfigMap")
+				restoreCM := &corev1.ConfigMap{}
+				if getErr := k8sClient.Get(ctx, client.ObjectKey{
+					Name:      utils.SpireServerConfigMapName,
+					Namespace: utils.OperatorNamespace,
+				}, restoreCM); getErr == nil {
+					if restoreCM.Labels == nil || restoreCM.Labels[utils.AppManagedByLabelKey] != utils.AppManagedByLabelValue {
+						utils.RestoreManagedByLabel(ctx, k8sClient, restoreCM)
+					}
+				}
+				utils.WaitForSpireServerConditions(ctx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+					"ServerConfigMapAvailable": metav1.ConditionTrue,
+					"Ready":                    metav1.ConditionTrue,
+				}, utils.DefaultTimeout)
+			})
+
+			By("Simultaneously removing managed-by label from SpireAgent Service")
+			svc := &corev1.Service{}
+			err = k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireAgentServiceName,
+				Namespace: utils.OperatorNamespace,
+			}, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpireAgent Service")
+
+			err = utils.RemoveManagedByLabel(testCtx, k8sClient, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from SpireAgent Service")
+			DeferCleanup(func(ctx context.Context) {
+				By("Restoring managed-by label on SpireAgent Service")
+				restoreSvc := &corev1.Service{}
+				if getErr := k8sClient.Get(ctx, client.ObjectKey{
+					Name:      utils.SpireAgentServiceName,
+					Namespace: utils.OperatorNamespace,
+				}, restoreSvc); getErr == nil {
+					if restoreSvc.Labels == nil || restoreSvc.Labels[utils.AppManagedByLabelKey] != utils.AppManagedByLabelValue {
+						utils.RestoreManagedByLabel(ctx, k8sClient, restoreSvc)
+					}
+				}
+				utils.WaitForSpireAgentConditions(ctx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+					"ServiceAvailable": metav1.ConditionTrue,
+					"Ready":            metav1.ConditionTrue,
+				}, utils.DefaultTimeout)
+			})
+
+			By("Waiting for both controllers to detect conflicts independently")
+			utils.WaitForConditionReason(testCtx, k8sClient, "cluster",
+				utils.GetSpireServerConditions,
+				"ServerConfigMapAvailable", metav1.ConditionFalse, "ResourceConflict",
+				utils.DefaultTimeout)
+			utils.WaitForConditionReason(testCtx, k8sClient, "cluster",
+				utils.GetSpireAgentConditions,
+				"ServiceAvailable", metav1.ConditionFalse, "ResourceConflict",
+				utils.DefaultTimeout)
+
+			By("Verifying SpiffeCSIDriver remains unaffected")
+			utils.WaitForSpiffeCSIDriverConditions(testCtx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+				"Ready": metav1.ConditionTrue,
+			}, utils.ShortTimeout)
+
+			By("Restoring both labels to trigger recovery")
+			err = k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireServerConfigMapName,
+				Namespace: utils.OperatorNamespace,
+			}, cm)
+			Expect(err).NotTo(HaveOccurred())
+			err = utils.RestoreManagedByLabel(testCtx, k8sClient, cm)
+			Expect(err).NotTo(HaveOccurred(), "failed to restore managed-by label on SpireServer ConfigMap")
+
+			err = k8sClient.Get(testCtx, client.ObjectKey{
+				Name:      utils.SpireAgentServiceName,
+				Namespace: utils.OperatorNamespace,
+			}, svc)
+			Expect(err).NotTo(HaveOccurred())
+			err = utils.RestoreManagedByLabel(testCtx, k8sClient, svc)
+			Expect(err).NotTo(HaveOccurred(), "failed to restore managed-by label on SpireAgent Service")
+
+			By("Verifying both controllers recover")
+			utils.WaitForSpireServerConditions(testCtx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+				"ServerConfigMapAvailable": metav1.ConditionTrue,
+				"Ready":                    metav1.ConditionTrue,
+			}, utils.DefaultTimeout)
+			utils.WaitForSpireAgentConditions(testCtx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+				"ServiceAvailable": metav1.ConditionTrue,
+				"Ready":            metav1.ConditionTrue,
+			}, utils.DefaultTimeout)
+		})
+	})
+
 	Context("CreateOnlyMode", func() {
 		It("should transition based on CREATE_ONLY_MODE env var value", func() {
 			By("Verifying CreateOnlyMode condition is not set by default")
