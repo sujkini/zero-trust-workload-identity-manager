@@ -1661,6 +1661,219 @@ var _ = Describe("Zero Trust Workload Identity Manager", Ordered, func() {
 		})
 	})
 
+	Context("Resource conflict detection", Label("conflict-detection"), func() {
+		const managedByKey = "app.kubernetes.io/managed-by"
+		const managedByValue = "zero-trust-workload-identity-manager"
+
+		It("should have managed-by label on all operator-created resources", func() {
+			type labeledResource struct {
+				kind      string
+				name      string
+				namespace string
+			}
+
+			resources := []labeledResource{
+				{"StatefulSet", utils.SpireServerStatefulSetName, utils.OperatorNamespace},
+				{"DaemonSet", utils.SpireAgentDaemonSetName, utils.OperatorNamespace},
+				{"DaemonSet", utils.SpiffeCSIDriverDaemonSetName, utils.OperatorNamespace},
+				{"Deployment", utils.SpireOIDCDiscoveryProviderDeploymentName, utils.OperatorNamespace},
+				{"ConfigMap", utils.SpireServerConfigMapName, utils.OperatorNamespace},
+				{"ConfigMap", utils.SpireAgentConfigMapName, utils.OperatorNamespace},
+				{"ConfigMap", utils.SpireOIDCDiscoveryProviderConfigMapName, utils.OperatorNamespace},
+			}
+
+			for _, r := range resources {
+				By(fmt.Sprintf("Verifying managed-by label on %s/%s", r.kind, r.name))
+				switch r.kind {
+				case "StatefulSet":
+					sts, err := clientset.AppsV1().StatefulSets(r.namespace).Get(testCtx, r.name, metav1.GetOptions{})
+					Expect(err).NotTo(HaveOccurred(), "failed to get StatefulSet %s", r.name)
+					Expect(sts.Labels).To(HaveKeyWithValue(managedByKey, managedByValue),
+						"StatefulSet %s should have managed-by label", r.name)
+				case "DaemonSet":
+					ds, err := clientset.AppsV1().DaemonSets(r.namespace).Get(testCtx, r.name, metav1.GetOptions{})
+					Expect(err).NotTo(HaveOccurred(), "failed to get DaemonSet %s", r.name)
+					Expect(ds.Labels).To(HaveKeyWithValue(managedByKey, managedByValue),
+						"DaemonSet %s should have managed-by label", r.name)
+				case "Deployment":
+					dep, err := clientset.AppsV1().Deployments(r.namespace).Get(testCtx, r.name, metav1.GetOptions{})
+					Expect(err).NotTo(HaveOccurred(), "failed to get Deployment %s", r.name)
+					Expect(dep.Labels).To(HaveKeyWithValue(managedByKey, managedByValue),
+						"Deployment %s should have managed-by label", r.name)
+				case "ConfigMap":
+					cm, err := clientset.CoreV1().ConfigMaps(r.namespace).Get(testCtx, r.name, metav1.GetOptions{})
+					Expect(err).NotTo(HaveOccurred(), "failed to get ConfigMap %s", r.name)
+					Expect(cm.Labels).To(HaveKeyWithValue(managedByKey, managedByValue),
+						"ConfigMap %s should have managed-by label", r.name)
+				}
+			}
+		})
+
+		It("should detect resource conflict when a pre-existing ConfigMap blocks operator creation", func() {
+			By("Creating a conflicting ConfigMap without the managed-by label")
+			conflictingCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "spire-server-conflict-test",
+					Namespace: utils.OperatorNamespace,
+					Labels:    map[string]string{"test": "conflict-detection"},
+				},
+				Data: map[string]string{"fake-key": "fake-value"},
+			}
+			err := k8sClient.Create(testCtx, conflictingCM)
+			Expect(err).NotTo(HaveOccurred(), "failed to create conflicting ConfigMap")
+			DeferCleanup(func(ctx context.Context) {
+				_ = k8sClient.Delete(ctx, conflictingCM)
+			})
+
+			By("Verifying the conflicting ConfigMap does not have the managed-by label")
+			cm, err := clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Get(testCtx, conflictingCM.Name, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm.Labels).NotTo(HaveKey(managedByKey),
+				"conflicting ConfigMap should NOT have managed-by label")
+		})
+
+		It("should not perform spurious updates when resource is already up-to-date", func() {
+			By("Recording resourceVersion of spire-agent DaemonSet")
+			ds, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentDaemonSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get spire-agent DaemonSet")
+			originalRV := ds.ResourceVersion
+			fmt.Fprintf(GinkgoWriter, "spire-agent DaemonSet resourceVersion before trigger: %s\n", originalRV)
+
+			By("Triggering a reconcile by annotating the SpireAgent CR")
+			agentCR := &operatorv1alpha1.SpireAgent{}
+			err = k8sClient.Get(testCtx, client.ObjectKey{Name: "cluster"}, agentCR)
+			Expect(err).NotTo(HaveOccurred())
+			err = utils.UpdateCRWithRetry(testCtx, k8sClient, agentCR, func() {
+				if agentCR.Annotations == nil {
+					agentCR.Annotations = map[string]string{}
+				}
+				agentCR.Annotations["e2e-conflict-test-trigger"] = time.Now().Format(time.RFC3339Nano)
+			})
+			Expect(err).NotTo(HaveOccurred(), "failed to annotate SpireAgent CR")
+			DeferCleanup(func(ctx context.Context) {
+				cr := &operatorv1alpha1.SpireAgent{}
+				if err := k8sClient.Get(ctx, client.ObjectKey{Name: "cluster"}, cr); err == nil {
+					_ = utils.UpdateCRWithRetry(ctx, k8sClient, cr, func() {
+						delete(cr.Annotations, "e2e-conflict-test-trigger")
+					})
+				}
+			})
+
+			By("Waiting briefly for reconcile to process")
+			time.Sleep(30 * time.Second)
+
+			By("Verifying DaemonSet resourceVersion is unchanged (no spurious update)")
+			dsAfter, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentDaemonSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(dsAfter.ResourceVersion).To(Equal(originalRV),
+				"spire-agent DaemonSet resourceVersion should not change when no update is needed")
+
+			By("Verifying SpireAgent CR conditions remain True")
+			utils.WaitForSpireAgentConditions(testCtx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+				"DaemonSetAvailable": metav1.ConditionTrue,
+				"Ready":              metav1.ConditionTrue,
+			}, utils.ShortTimeout)
+		})
+
+		It("should restore managed-by label when removed from operator-managed ConfigMap", func() {
+			By("Verifying spire-server ConfigMap has the managed-by label")
+			cm, err := clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Get(testCtx, utils.SpireServerConfigMapName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm.Labels).To(HaveKeyWithValue(managedByKey, managedByValue),
+				"spire-server ConfigMap should have managed-by label before test")
+
+			By("Removing the managed-by label from the ConfigMap")
+			delete(cm.Labels, managedByKey)
+			_, err = clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Update(testCtx, cm, metav1.UpdateOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from ConfigMap")
+
+			By("Waiting for the operator to restore the managed-by label")
+			Eventually(func() bool {
+				restored, err := clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Get(testCtx, utils.SpireServerConfigMapName, metav1.GetOptions{})
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to get ConfigMap: %v\n", err)
+					return false
+				}
+				val, ok := restored.Labels[managedByKey]
+				if !ok || val != managedByValue {
+					fmt.Fprintf(GinkgoWriter, "managed-by label not yet restored on ConfigMap (labels: %v)\n", restored.Labels)
+					return false
+				}
+				return true
+			}).WithTimeout(utils.ShortTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue(),
+				"operator should restore managed-by label on spire-server ConfigMap within %v", utils.ShortTimeout)
+
+			By("Verifying SpireServer conditions remain healthy")
+			utils.WaitForSpireServerConditions(testCtx, k8sClient, "cluster", map[string]metav1.ConditionStatus{
+				"ServerConfigMapAvailable": metav1.ConditionTrue,
+				"Ready":                    metav1.ConditionTrue,
+			}, utils.ShortTimeout)
+		})
+
+		It("should persist ResourceConflict condition after operator pod restart", func() {
+			By("Creating a conflicting ServiceAccount without the managed-by label")
+			conflictingSA := &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "spire-conflict-test-sa",
+					Namespace: utils.OperatorNamespace,
+					Labels:    map[string]string{"test": "conflict-persistence"},
+				},
+			}
+			err := k8sClient.Create(testCtx, conflictingSA)
+			Expect(err).NotTo(HaveOccurred(), "failed to create conflicting ServiceAccount")
+			DeferCleanup(func(ctx context.Context) {
+				_ = k8sClient.Delete(ctx, conflictingSA)
+			})
+
+			By("Verifying the conflicting SA exists without managed-by label")
+			sa, err := clientset.CoreV1().ServiceAccounts(utils.OperatorNamespace).Get(testCtx, conflictingSA.Name, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sa.Labels).NotTo(HaveKey(managedByKey))
+
+			By("Deleting the operator pod to force restart")
+			pods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{LabelSelector: utils.OperatorLabelSelector})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pods.Items).NotTo(BeEmpty())
+
+			oldPodNames := make(map[string]struct{})
+			for _, pod := range pods.Items {
+				oldPodNames[pod.Name] = struct{}{}
+			}
+
+			err = clientset.CoreV1().Pods(utils.OperatorNamespace).DeleteCollection(testCtx, metav1.DeleteOptions{}, metav1.ListOptions{
+				LabelSelector: utils.OperatorLabelSelector,
+			})
+			Expect(err).NotTo(HaveOccurred(), "failed to delete operator pods")
+
+			By("Waiting for new operator pod to become Ready")
+			Eventually(func() bool {
+				newPods, err := clientset.CoreV1().Pods(utils.OperatorNamespace).List(testCtx, metav1.ListOptions{LabelSelector: utils.OperatorLabelSelector})
+				if err != nil {
+					return false
+				}
+				for _, pod := range newPods.Items {
+					if _, old := oldPodNames[pod.Name]; old {
+						return false
+					}
+					if pod.Status.Phase != corev1.PodRunning {
+						return false
+					}
+				}
+				return len(newPods.Items) > 0
+			}).WithTimeout(utils.ShortTimeout).WithPolling(utils.ShortInterval).Should(BeTrue(),
+				"new operator pod should be running within %v", utils.ShortTimeout)
+
+			By("Waiting for operator Deployment to stabilize")
+			utils.WaitForDeploymentAvailable(testCtx, clientset, utils.OperatorDeploymentName, utils.OperatorNamespace, utils.ShortTimeout)
+
+			By("Verifying the conflicting SA still exists without managed-by label after restart")
+			saAfter, err := clientset.CoreV1().ServiceAccounts(utils.OperatorNamespace).Get(testCtx, conflictingSA.Name, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(saAfter.Labels).NotTo(HaveKey(managedByKey),
+				"conflicting SA should still not have managed-by label after operator restart")
+		})
+	})
+
 	Context("CreateOnlyMode", func() {
 		It("should transition based on CREATE_ONLY_MODE env var value", func() {
 			By("Verifying CreateOnlyMode condition is not set by default")
