@@ -117,7 +117,7 @@ Each requirement must be **specific** (tied to observable behavior), **measurabl
 
 ### B.4 Audit existing tests
 
-**Before drafting any E2E/NEG test**, follow Section G.1 (Existing Test Audit). Apply the reusability decision framework to determine whether each test extends an existing spec or needs a new one.
+Before E2E/NEG cases: Section G.1 (audit) + G.6 (architecture traps) — see Quick Start.
 
 ### B.5 Draft test cases
 
@@ -149,7 +149,7 @@ Fetch the PR diff and categorize changed files:
 
 ### C.2 Audit existing tests (mandatory)
 
-Follow **Section G.1** to read existing tests. Apply the reusability decision framework. Review **Section G.6** (Architecture Awareness) to avoid invalid test scenarios.
+Before E2E/NEG cases: Section G.1 + G.6 — see Quick Start.
 
 ### C.3 Extract testable behaviors
 
@@ -391,49 +391,11 @@ Before proposing any new E2E test, you MUST:
 
 ### G.2 Reusable Utilities
 
-Always use existing utilities from `test/e2e/utils/`. If a utility does not exist, propose adding it to `utils.go` rather than inlining complex logic in `e2e_test.go`.
-
-**Pod/workload setup:**
-
-| Function | Returns | What it does |
-| --- | --- | --- |
-| `SetupAttestationTest(ctx, k8sClient, clientset, prefix, cspiffeIDMutator)` | `AttestationFixture` | Creates namespace, ClusterSPIFFEID, SA, ConfigMap, pod; waits for ready + SVID files; registers DeferCleanup. Pass `nil` mutator for defaults. |
-
-**Certificate helpers:**
-
-| Function | Returns |
-| --- | --- |
-| `ReadAndParseSVIDCertificate(ctx, ns, pod, container)` | `(stdout, block, rest, *x509.Certificate, error)` |
-| `ReadSVIDPEM` / `ReadBundlePEM` | `(string, error)` |
-| `ParsePEMCertificate` (first cert) / `ParseAllPEMCertificates` (all certs) | `(*x509.Certificate, error)` / `([]*x509.Certificate, error)` |
-
-**Other key utilities:**
-
-| Function | Purpose |
-| --- | --- |
-| `ExecInPod(ctx, ns, pod, container, cmd)` | Run command in pod. For shell expansion, wrap in `[]string{"sh", "-c", "cmd string"}` |
-| `UpdateCRWithRetry(ctx, k8sClient, obj, updateFunc)` | Optimistic locking with 5 conflict retries |
-| `WaitForPodReady` / `WaitForDeploymentAvailable` / `WaitForStatefulSetReady` / `WaitForDaemonSetAvailable` | Readiness polling |
-| `WaitFor*RollingUpdate(ctx, clientset, name, ns, initialGen, timeout)` | Generation-based rolling update wait |
-| `WaitForSpireServerConditions` / `...AgentConditions` / `...CSIDriverConditions` / `...OIDCConditions` | CR condition polling |
-| `VerifyContainerResources` / `VerifyPodLabels` / `VerifyPodScheduling` | Post-rollout verification |
-| `PatchSubscriptionEnv` + `WaitForDeploymentEnvVar` | OLM-safe operator config changes |
+Read `test/e2e/utils/utils.go` before proposing or implementing E2E steps. Reuse existing helpers; if new helper logic is needed, add it under `test/e2e/utils/`, not inline in `e2e_test.go`.
 
 ### G.3 Constants (never hardcode)
 
-Always use constants from `test/e2e/utils/constants.go`:
-
-| Category | Key constants |
-| --- | --- |
-| Timeouts | `DefaultTimeout` (5m), `ShortTimeout` (2m), `DefaultInterval` (10s), `ShortInterval` (5s), `TestContextTimeout` (10m) |
-| Operator | `OperatorNamespace`, `OperatorDeploymentName`, `OperatorLabelSelector` |
-| SPIRE Server | `SpireServerStatefulSetName`, `SpireServerPodLabel`, `SpireServerConfigMapName` |
-| SPIRE Agent | `SpireAgentDaemonSetName`, `SpireAgentPodLabel` |
-| SPIFFE CSI | `SpiffeCSIDriverDaemonSetName`, `SpiffeCSIDriverPodLabel` |
-| OIDC Provider | `SpireOIDCDiscoveryProviderDeploymentName`, `SpireOIDCDiscoveryProviderPodLabel` |
-| Metrics | `OperatorMetricsServiceName`, `OperatorMetricsPort` (8443) |
-| Attestation | `SpiffeHelperImage`, `SpiffeHelperContainerName`, `SpiffeHelperConfigMapName` |
-| SVID | `DefaultX509SVIDTTL` (1h), `ClockSkewTolerance` (1m) |
+Use `test/e2e/utils/constants.go` for timeouts, resource names, and labels — never literal values in plans or test code.
 
 ### G.4 Security Logging Rules
 
@@ -525,15 +487,7 @@ Context("SVID validation", func() {
 
 ## H. Reference
 
-### H.1 Methodology definitions
-
-| Methodology | When to use | Example |
-| --- | --- | --- |
-| **Black box** | No code knowledge. Test through K8s API/CLI only. | `kubectl apply` CR → assert Deployment Ready |
-| **White box** | Full code knowledge. Target specific branches. | Unit test for StatefulSet spec builder |
-| **Grey box** | Partial knowledge. External interaction + internal observation. | Create CR, verify reconcile via metrics/logs |
-
-### H.2 Upstream SPIRE test reference
+### H.1 Upstream SPIRE test reference
 
 The upstream [spiffe/spire](https://github.com/spiffe/spire) project maintains high testing standards. Use their patterns as a quality bar.
 

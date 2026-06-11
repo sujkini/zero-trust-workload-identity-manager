@@ -100,10 +100,18 @@
 | File | Before | After | Delta |
 | --- | --- | --- | --- |
 | `qe-behaviour.mdc` | 122 | 115 | −7 |
-| `test-plan-generation.mdc` | 520 | 506 | −14 |
-| **Combined always-on** | 642 | 621 | −21 |
+| `test-plan-generation.mdc` | 520 | 509 | −11 (Part 2) |
+| **Combined always-on** | 642 | 624 | −18 (Part 1 + Part 2) |
 
-Part 2 (intra-file trims: Section H.1, G.2/G.3 catalogs) is **not** applied in this pass.
+### Part 2 — Intra-file trims (2026-06-11)
+
+| File | Change |
+| --- | --- |
+| `test-plan-generation.mdc` | **Collapsed** B.4 and C.2 audit reminders → pointer to Quick Start + G.1/G.6 |
+| `test-plan-generation.mdc` | **Collapsed** G.2 and G.3 catalogs → read `utils.go` / `constants.go` |
+| `test-plan-generation.mdc` | **Removed** H.1 methodology table (duplicate of D tier Method column); renumbered SPIRE ref to H.1 |
+
+**Why:** Reference catalogs in rules waste tokens; G.1 and the repo are the source of truth at implementation time.
 
 ### Gate checklist in plan file (2026-06-02)
 
