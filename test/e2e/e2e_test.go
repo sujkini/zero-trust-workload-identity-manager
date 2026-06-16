@@ -512,7 +512,7 @@ var _ = Describe("Zero Trust Workload Identity Manager", Ordered, func() {
 				}
 				rotatedCert = c
 				return c.SerialNumber.String()
-			}).WithTimeout(3 * time.Minute).WithPolling(10 * time.Second).ShouldNot(Equal(initialSerial),
+			}).WithTimeout(3*time.Minute).WithPolling(10*time.Second).ShouldNot(Equal(initialSerial),
 				"SVID serial number must change after rotation")
 
 			By("Verifying rotated certificate is still valid")
@@ -1658,6 +1658,259 @@ var _ = Describe("Zero Trust Workload Identity Manager", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(pods.Items).NotTo(BeEmpty())
 			utils.VerifyPodLabels(pods.Items, testLabels)
+		})
+	})
+
+	Context("Resource conflict detection", func() {
+		It("should have managed-by label on all operand workloads", Label("reconciliation", "controller-manager"), func() {
+			By("Verifying managed-by label on SpireServer StatefulSet")
+			sts, err := clientset.AppsV1().StatefulSets(utils.OperatorNamespace).Get(testCtx, utils.SpireServerStatefulSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpireServer StatefulSet")
+			Expect(sts.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"StatefulSet %s must have managed-by label", sts.Name)
+
+			By("Verifying managed-by label on SpireAgent DaemonSet")
+			agentDS, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentDaemonSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpireAgent DaemonSet")
+			Expect(agentDS.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"DaemonSet %s must have managed-by label", agentDS.Name)
+
+			By("Verifying managed-by label on SpiffeCSIDriver DaemonSet")
+			csiDS, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpiffeCSIDriverDaemonSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpiffeCSIDriver DaemonSet")
+			Expect(csiDS.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"DaemonSet %s must have managed-by label", csiDS.Name)
+
+			By("Verifying managed-by label on SpireOIDCDiscoveryProvider Deployment")
+			oidcDeploy, err := clientset.AppsV1().Deployments(utils.OperatorNamespace).Get(testCtx, utils.SpireOIDCDiscoveryProviderDeploymentName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get SpireOIDCDiscoveryProvider Deployment")
+			Expect(oidcDeploy.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"Deployment %s must have managed-by label", oidcDeploy.Name)
+		})
+
+		It("should have managed-by label on all operand ServiceAccounts", Label("reconciliation", "controller-manager"), func() {
+			serviceAccounts := []string{
+				utils.SpireServerServiceAccountName,
+				utils.SpireAgentServiceAccountName,
+				utils.SpiffeCSIDriverServiceAccountName,
+				utils.SpireOIDCDiscoveryProviderServiceAccountName,
+			}
+			for _, saName := range serviceAccounts {
+				By(fmt.Sprintf("Verifying managed-by label on ServiceAccount %s", saName))
+				sa, err := clientset.CoreV1().ServiceAccounts(utils.OperatorNamespace).Get(testCtx, saName, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred(), "failed to get ServiceAccount %s", saName)
+				Expect(sa.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+					"ServiceAccount %s must have managed-by label", saName)
+			}
+		})
+
+		It("should have managed-by label on operand ConfigMaps", Label("reconciliation", "configmap"), func() {
+			configMaps := []string{
+				utils.SpireServerConfigMapName,
+				utils.SpireAgentConfigMapName,
+				utils.SpireControllerManagerConfigMapName,
+			}
+			for _, cmName := range configMaps {
+				By(fmt.Sprintf("Verifying managed-by label on ConfigMap %s", cmName))
+				cm, err := clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Get(testCtx, cmName, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred(), "failed to get ConfigMap %s", cmName)
+				Expect(cm.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+					"ConfigMap %s must have managed-by label", cmName)
+			}
+		})
+
+		It("should have managed-by label on RBAC resources", Label("rbac", "reconciliation"), func() {
+			By("Verifying managed-by label on SpireServer ClusterRole")
+			cr, err := clientset.RbacV1().ClusterRoles().Get(testCtx, utils.SpireServerClusterRoleName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get ClusterRole %s", utils.SpireServerClusterRoleName)
+			Expect(cr.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"ClusterRole %s must have managed-by label", cr.Name)
+
+			By("Verifying managed-by label on SpireServer ClusterRoleBinding")
+			crb, err := clientset.RbacV1().ClusterRoleBindings().Get(testCtx, utils.SpireServerClusterRoleBindingName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get ClusterRoleBinding %s", utils.SpireServerClusterRoleBindingName)
+			Expect(crb.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"ClusterRoleBinding %s must have managed-by label", crb.Name)
+
+			By("Verifying managed-by label on SpireAgent ClusterRole")
+			agentCR, err := clientset.RbacV1().ClusterRoles().Get(testCtx, utils.SpireAgentClusterRoleName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get ClusterRole %s", utils.SpireAgentClusterRoleName)
+			Expect(agentCR.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"ClusterRole %s must have managed-by label", agentCR.Name)
+
+			By("Verifying managed-by label on SpireAgent ClusterRoleBinding")
+			agentCRB, err := clientset.RbacV1().ClusterRoleBindings().Get(testCtx, utils.SpireAgentClusterRoleBindingName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get ClusterRoleBinding %s", utils.SpireAgentClusterRoleBindingName)
+			Expect(agentCRB.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"ClusterRoleBinding %s must have managed-by label", agentCRB.Name)
+
+			By("Verifying managed-by label on spire-controller-manager ClusterRole")
+			ctrlCR, err := clientset.RbacV1().ClusterRoles().Get(testCtx, utils.SpireControllerManagerClusterRoleName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get ClusterRole %s", utils.SpireControllerManagerClusterRoleName)
+			Expect(ctrlCR.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"ClusterRole %s must have managed-by label", ctrlCR.Name)
+
+			By("Verifying managed-by label on spire-controller-manager ClusterRoleBinding")
+			ctrlCRB, err := clientset.RbacV1().ClusterRoleBindings().Get(testCtx, utils.SpireControllerManagerClusterRoleBindingName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get ClusterRoleBinding %s", utils.SpireControllerManagerClusterRoleBindingName)
+			Expect(ctrlCRB.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"ClusterRoleBinding %s must have managed-by label", ctrlCRB.Name)
+		})
+
+		It("should have managed-by label on operand Services", Label("reconciliation", "controller-manager"), func() {
+			services := []string{
+				utils.SpireServerServiceAccountName,
+				utils.SpireAgentServiceAccountName,
+				utils.SpireOIDCDiscoveryProviderServiceAccountName,
+				utils.SpireControllerManagerWebhookServiceName,
+			}
+			for _, svcName := range services {
+				By(fmt.Sprintf("Verifying managed-by label on Service %s", svcName))
+				svc, err := clientset.CoreV1().Services(utils.OperatorNamespace).Get(testCtx, svcName, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred(), "failed to get Service %s", svcName)
+				Expect(svc.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+					"Service %s must have managed-by label", svcName)
+			}
+		})
+
+		It("should have managed-by label on SCC resources", Label("openshift-scc", "security-context"), func() {
+			By("Verifying managed-by label on spire-agent SCC")
+			agentSCC := utils.GetSCC(testCtx, k8sClient, utils.SpireAgentSCCName)
+			Expect(agentSCC.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"SCC %s must have managed-by label", utils.SpireAgentSCCName)
+
+			By("Verifying managed-by label on spiffe-csi-driver SCC")
+			csiSCC := utils.GetSCC(testCtx, k8sClient, utils.SpiffeCSIDriverSCCName)
+			Expect(csiSCC.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue),
+				"SCC %s must have managed-by label", utils.SpiffeCSIDriverSCCName)
+		})
+
+		It("should have correct ConfigMap data key names", Label("configmap", "reconciliation"), func() {
+			By("Verifying spire-server ConfigMap has server.conf key")
+			serverCM, err := clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Get(testCtx, utils.SpireServerConfigMapName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(serverCM.Data).To(HaveKey(utils.SpireServerConfigKey),
+				"ConfigMap %s must have key %s", utils.SpireServerConfigMapName, utils.SpireServerConfigKey)
+			Expect(serverCM.Data[utils.SpireServerConfigKey]).NotTo(BeEmpty(),
+				"ConfigMap %s key %s must not be empty", utils.SpireServerConfigMapName, utils.SpireServerConfigKey)
+
+			By("Verifying spire-agent ConfigMap has agent.conf key")
+			agentCM, err := clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentConfigMapName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(agentCM.Data).To(HaveKey(utils.SpireAgentConfigKey),
+				"ConfigMap %s must have key %s", utils.SpireAgentConfigMapName, utils.SpireAgentConfigKey)
+			Expect(agentCM.Data[utils.SpireAgentConfigKey]).NotTo(BeEmpty(),
+				"ConfigMap %s key %s must not be empty", utils.SpireAgentConfigMapName, utils.SpireAgentConfigKey)
+
+			By("Verifying spire-controller-manager ConfigMap has controller-manager-config.yaml key")
+			ctrlCM, err := clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Get(testCtx, utils.SpireControllerManagerConfigMapName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ctrlCM.Data).To(HaveKey(utils.SpireControllerManagerConfigKey),
+				"ConfigMap %s must have key %s", utils.SpireControllerManagerConfigMapName, utils.SpireControllerManagerConfigKey)
+			Expect(ctrlCM.Data[utils.SpireControllerManagerConfigKey]).NotTo(BeEmpty(),
+				"ConfigMap %s key %s must not be empty", utils.SpireControllerManagerConfigMapName, utils.SpireControllerManagerConfigKey)
+		})
+
+		It("should reconcile managed-by label drift on StatefulSet", Label("reconciliation", "controller-manager"), func() {
+			By("Getting StatefulSet and confirming managed-by label exists")
+			sts, err := clientset.AppsV1().StatefulSets(utils.OperatorNamespace).Get(testCtx, utils.SpireServerStatefulSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sts.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue))
+
+			By("Removing managed-by label from StatefulSet to simulate drift")
+			patchData := fmt.Sprintf(`{"metadata":{"labels":{"%s":null}}}`, utils.AppManagedByLabelKey)
+			_, err = clientset.AppsV1().StatefulSets(utils.OperatorNamespace).Patch(
+				testCtx, utils.SpireServerStatefulSetName,
+				types.StrategicMergePatchType, []byte(patchData), metav1.PatchOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from StatefulSet")
+
+			By("Waiting for operator to reconcile and restore the managed-by label")
+			Eventually(func() bool {
+				sts, err := clientset.AppsV1().StatefulSets(utils.OperatorNamespace).Get(testCtx, utils.SpireServerStatefulSetName, metav1.GetOptions{})
+				if err != nil {
+					return false
+				}
+				return sts.Labels[utils.AppManagedByLabelKey] == utils.AppManagedByLabelValue
+			}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue(),
+				"operator should restore managed-by label on StatefulSet within %v", utils.DefaultTimeout)
+
+			By("Verifying spire-server pods remain healthy after drift correction")
+			utils.WaitForStatefulSetReady(testCtx, clientset, utils.SpireServerStatefulSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+		})
+
+		It("should reconcile managed-by label drift on DaemonSet", Label("reconciliation", "controller-manager"), func() {
+			By("Getting DaemonSet and confirming managed-by label exists")
+			ds, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentDaemonSetName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ds.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue))
+
+			By("Removing managed-by label from DaemonSet to simulate drift")
+			patchData := fmt.Sprintf(`{"metadata":{"labels":{"%s":null}}}`, utils.AppManagedByLabelKey)
+			_, err = clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Patch(
+				testCtx, utils.SpireAgentDaemonSetName,
+				types.StrategicMergePatchType, []byte(patchData), metav1.PatchOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from DaemonSet")
+
+			By("Waiting for operator to reconcile and restore the managed-by label")
+			Eventually(func() bool {
+				ds, err := clientset.AppsV1().DaemonSets(utils.OperatorNamespace).Get(testCtx, utils.SpireAgentDaemonSetName, metav1.GetOptions{})
+				if err != nil {
+					return false
+				}
+				return ds.Labels[utils.AppManagedByLabelKey] == utils.AppManagedByLabelValue
+			}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue(),
+				"operator should restore managed-by label on DaemonSet within %v", utils.DefaultTimeout)
+
+			By("Verifying spire-agent pods remain healthy after drift correction")
+			utils.WaitForDaemonSetAvailable(testCtx, clientset, utils.SpireAgentDaemonSetName, utils.OperatorNamespace, utils.DefaultTimeout)
+		})
+
+		It("should reconcile managed-by label drift on ConfigMap", Label("reconciliation", "configmap"), func() {
+			By("Getting ConfigMap and confirming managed-by label exists")
+			cm, err := clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Get(testCtx, utils.SpireServerConfigMapName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cm.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue))
+
+			By("Removing managed-by label from ConfigMap to simulate drift")
+			patchData := fmt.Sprintf(`{"metadata":{"labels":{"%s":null}}}`, utils.AppManagedByLabelKey)
+			_, err = clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Patch(
+				testCtx, utils.SpireServerConfigMapName,
+				types.StrategicMergePatchType, []byte(patchData), metav1.PatchOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from ConfigMap")
+
+			By("Waiting for operator to reconcile and restore the managed-by label")
+			Eventually(func() bool {
+				cm, err := clientset.CoreV1().ConfigMaps(utils.OperatorNamespace).Get(testCtx, utils.SpireServerConfigMapName, metav1.GetOptions{})
+				if err != nil {
+					return false
+				}
+				return cm.Labels[utils.AppManagedByLabelKey] == utils.AppManagedByLabelValue
+			}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue(),
+				"operator should restore managed-by label on ConfigMap within %v", utils.DefaultTimeout)
+		})
+
+		It("should reconcile managed-by label drift on ServiceAccount", Label("reconciliation", "controller-manager"), func() {
+			By("Getting ServiceAccount and confirming managed-by label exists")
+			sa, err := clientset.CoreV1().ServiceAccounts(utils.OperatorNamespace).Get(testCtx, utils.SpireServerServiceAccountName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sa.Labels).To(HaveKeyWithValue(utils.AppManagedByLabelKey, utils.AppManagedByLabelValue))
+
+			By("Removing managed-by label from ServiceAccount to simulate drift")
+			patchData := fmt.Sprintf(`{"metadata":{"labels":{"%s":null}}}`, utils.AppManagedByLabelKey)
+			_, err = clientset.CoreV1().ServiceAccounts(utils.OperatorNamespace).Patch(
+				testCtx, utils.SpireServerServiceAccountName,
+				types.StrategicMergePatchType, []byte(patchData), metav1.PatchOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to remove managed-by label from ServiceAccount")
+
+			By("Waiting for operator to reconcile and restore the managed-by label")
+			Eventually(func() bool {
+				sa, err := clientset.CoreV1().ServiceAccounts(utils.OperatorNamespace).Get(testCtx, utils.SpireServerServiceAccountName, metav1.GetOptions{})
+				if err != nil {
+					return false
+				}
+				return sa.Labels[utils.AppManagedByLabelKey] == utils.AppManagedByLabelValue
+			}).WithTimeout(utils.DefaultTimeout).WithPolling(utils.DefaultInterval).Should(BeTrue(),
+				"operator should restore managed-by label on ServiceAccount within %v", utils.DefaultTimeout)
 		})
 	})
 

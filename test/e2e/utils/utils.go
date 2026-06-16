@@ -38,6 +38,7 @@ import (
 
 	spiffev1alpha1 "github.com/spiffe/spire-controller-manager/api/v1alpha1"
 
+	securityv1 "github.com/openshift/api/security/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -1096,4 +1097,12 @@ func SetupAttestationTest(ctx context.Context, k8sClient client.Client, clientse
 		SAName:       saName,
 		AppContainer: appContainer,
 	}
+}
+
+// GetSCC fetches a SecurityContextConstraints by name using the typed client.
+func GetSCC(ctx context.Context, k8sClient client.Client, name string) *securityv1.SecurityContextConstraints {
+	scc := &securityv1.SecurityContextConstraints{}
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: name}, scc)
+	Expect(err).NotTo(HaveOccurred(), "failed to get SCC %s", name)
+	return scc
 }

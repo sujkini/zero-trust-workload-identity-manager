@@ -41,6 +41,30 @@ const (
 	SpireOIDCDiscoveryProviderConfigMapName  = "spire-spiffe-oidc-discovery-provider"
 	SpireOIDCDiscoveryProviderConfigKey      = "oidc-discovery-provider.conf"
 
+	AppManagedByLabelKey   = "app.kubernetes.io/managed-by"
+	AppManagedByLabelValue = "zero-trust-workload-identity-manager"
+
+	SpireServerServiceAccountName                = "spire-server"
+	SpireAgentServiceAccountName                 = "spire-agent"
+	SpiffeCSIDriverServiceAccountName            = "spire-spiffe-csi-driver"
+	SpireOIDCDiscoveryProviderServiceAccountName = "spire-spiffe-oidc-discovery-provider"
+
+	SpireServerClusterRoleName        = "spire-server"
+	SpireServerClusterRoleBindingName = "spire-server"
+	SpireAgentClusterRoleName         = "spire-agent"
+	SpireAgentClusterRoleBindingName  = "spire-agent"
+
+	SpireControllerManagerClusterRoleName        = "spire-controller-manager"
+	SpireControllerManagerClusterRoleBindingName = "spire-controller-manager"
+
+	SpireControllerManagerWebhookServiceName = "spire-controller-manager-webhook"
+
+	SpireAgentSCCName      = "spire-agent"
+	SpiffeCSIDriverSCCName = "spire-spiffe-csi-driver"
+
+	SpireControllerManagerConfigMapName = "spire-controller-manager-config"
+	SpireControllerManagerConfigKey     = "controller-manager-config.yaml"
+
 	SpiffeHelperConfigMapName = "spiffe-helper-config"
 	SpiffeHelperContainerName = "spiffe-helper"
 	SpiffeHelperImage         = "ghcr.io/spiffe/spiffe-helper:0.11.0"
