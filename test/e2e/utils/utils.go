@@ -1097,3 +1097,95 @@ func SetupAttestationTest(ctx context.Context, k8sClient client.Client, clientse
 		AppContainer: appContainer,
 	}
 }
+
+// RemoveManagedByLabel removes the app.kubernetes.io/managed-by label from a resource,
+// causing it to disappear from the operator's label-filtered cache.
+func RemoveManagedByLabel(ctx context.Context, k8sClient client.Client, obj client.Object) error {
+	labels := obj.GetLabels()
+	if labels == nil {
+		return nil
+	}
+	if _, ok := labels[AppManagedByLabelKey]; !ok {
+		return nil
+	}
+	patch := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:null}}}`, AppManagedByLabelKey))
+	return k8sClient.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patch))
+}
+
+// RestoreManagedByLabel adds the app.kubernetes.io/managed-by label back to a resource.
+func RestoreManagedByLabel(ctx context.Context, k8sClient client.Client, obj client.Object) error {
+	patch := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:%q}}}`, AppManagedByLabelKey, AppManagedByLabelValue))
+	return k8sClient.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patch))
+}
+
+// WaitForConditionReason waits for a specific condition on the given CR to have the expected
+// status and reason substring. Returns when the condition matches or times out.
+func WaitForConditionReason(ctx context.Context, k8sClient client.Client, crName string,
+	getCR func(context.Context, client.Client, string) ([]metav1.Condition, error),
+	conditionType string, expectedStatus metav1.ConditionStatus, expectedReasonSubstr string,
+	timeout time.Duration) {
+	Eventually(func() bool {
+		conditions, err := getCR(ctx, k8sClient, crName)
+		if err != nil {
+			fmt.Fprintf(GinkgoWriter, "failed to get CR '%s': %v\n", crName, err)
+			return false
+		}
+		for _, c := range conditions {
+			if c.Type == conditionType {
+				if c.Status != expectedStatus {
+					fmt.Fprintf(GinkgoWriter, "condition '%s' status is '%v', expected '%v' (reason: %s)\n",
+						conditionType, c.Status, expectedStatus, c.Reason)
+					return false
+				}
+				if expectedReasonSubstr != "" && !strings.Contains(c.Reason, expectedReasonSubstr) {
+					fmt.Fprintf(GinkgoWriter, "condition '%s' reason '%s' does not contain '%s'\n",
+						conditionType, c.Reason, expectedReasonSubstr)
+					return false
+				}
+				fmt.Fprintf(GinkgoWriter, "condition '%s' has expected status='%v' reason='%s'\n",
+					conditionType, expectedStatus, c.Reason)
+				return true
+			}
+		}
+		fmt.Fprintf(GinkgoWriter, "condition '%s' not found\n", conditionType)
+		return false
+	}).WithTimeout(timeout).WithPolling(ShortInterval).Should(BeTrue(),
+		"condition '%s' should have status '%v' with reason containing '%s' within %v",
+		conditionType, expectedStatus, expectedReasonSubstr, timeout)
+}
+
+// GetSpireServerConditions fetches SpireServer conditions for WaitForConditionReason.
+func GetSpireServerConditions(ctx context.Context, k8sClient client.Client, name string) ([]metav1.Condition, error) {
+	cr := &operatorv1alpha1.SpireServer{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
+		return nil, err
+	}
+	return cr.Status.Conditions, nil
+}
+
+// GetSpireAgentConditions fetches SpireAgent conditions for WaitForConditionReason.
+func GetSpireAgentConditions(ctx context.Context, k8sClient client.Client, name string) ([]metav1.Condition, error) {
+	cr := &operatorv1alpha1.SpireAgent{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
+		return nil, err
+	}
+	return cr.Status.Conditions, nil
+}
+
+// GetSpiffeCSIDriverConditions fetches SpiffeCSIDriver conditions for WaitForConditionReason.
+func GetSpiffeCSIDriverConditions(ctx context.Context, k8sClient client.Client, name string) ([]metav1.Condition, error) {
+	cr := &operatorv1alpha1.SpiffeCSIDriver{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
+		return nil, err
+	}
+	return cr.Status.Conditions, nil
+}
+
+// GetSpireOIDCDiscoveryProviderConditions fetches SpireOIDCDiscoveryProvider conditions for WaitForConditionReason.
+func GetSpireOIDCDiscoveryProviderConditions(ctx context.Context, k8sClient client.Client, name string) ([]metav1.Condition, error) {
+	cr := &operatorv1alpha1.SpireOIDCDiscoveryProvider{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
+		return nil, err
+	}
+	return cr.Status.Conditions, nil
+}
