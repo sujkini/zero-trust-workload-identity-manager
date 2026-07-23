@@ -829,6 +829,131 @@ func FindOperatorConditionName(ctx context.Context, k8sClient client.Client, nam
 	return "", foundNames, fmt.Errorf("no OperatorCondition matching '%s' found", nameFragment)
 }
 
+// GetConditionByType returns the condition with the given type from a list of conditions, or nil if not found.
+func GetConditionByType(conditions []metav1.Condition, conditionType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return &conditions[i]
+		}
+	}
+	return nil
+}
+
+// WaitForSpireServerConditionReason waits for a SpireServer condition to have the expected status and reason.
+func WaitForSpireServerConditionReason(ctx context.Context, k8sClient client.Client, name, condType string,
+	expectedStatus metav1.ConditionStatus, expectedReason string, timeout time.Duration) {
+	Eventually(func() bool {
+		cr := &operatorv1alpha1.SpireServer{}
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
+			fmt.Fprintf(GinkgoWriter, "failed to get SpireServer '%s': %v\n", name, err)
+			return false
+		}
+		cond := GetConditionByType(cr.Status.Conditions, condType)
+		if cond == nil {
+			fmt.Fprintf(GinkgoWriter, "condition '%s' not found on SpireServer '%s'\n", condType, name)
+			return false
+		}
+		if cond.Status != expectedStatus || cond.Reason != expectedReason {
+			fmt.Fprintf(GinkgoWriter, "SpireServer '%s' condition '%s': status=%s reason=%s, want status=%s reason=%s\n",
+				name, condType, cond.Status, cond.Reason, expectedStatus, expectedReason)
+			return false
+		}
+		return true
+	}).WithTimeout(timeout).WithPolling(ShortInterval).Should(BeTrue(),
+		"SpireServer '%s' condition '%s' should have status=%s reason=%s within %v",
+		name, condType, expectedStatus, expectedReason, timeout)
+}
+
+// WaitForSpireAgentConditionReason waits for a SpireAgent condition to have the expected status and reason.
+func WaitForSpireAgentConditionReason(ctx context.Context, k8sClient client.Client, name, condType string,
+	expectedStatus metav1.ConditionStatus, expectedReason string, timeout time.Duration) {
+	Eventually(func() bool {
+		cr := &operatorv1alpha1.SpireAgent{}
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
+			fmt.Fprintf(GinkgoWriter, "failed to get SpireAgent '%s': %v\n", name, err)
+			return false
+		}
+		cond := GetConditionByType(cr.Status.Conditions, condType)
+		if cond == nil {
+			fmt.Fprintf(GinkgoWriter, "condition '%s' not found on SpireAgent '%s'\n", condType, name)
+			return false
+		}
+		if cond.Status != expectedStatus || cond.Reason != expectedReason {
+			fmt.Fprintf(GinkgoWriter, "SpireAgent '%s' condition '%s': status=%s reason=%s, want status=%s reason=%s\n",
+				name, condType, cond.Status, cond.Reason, expectedStatus, expectedReason)
+			return false
+		}
+		return true
+	}).WithTimeout(timeout).WithPolling(ShortInterval).Should(BeTrue(),
+		"SpireAgent '%s' condition '%s' should have status=%s reason=%s within %v",
+		name, condType, expectedStatus, expectedReason, timeout)
+}
+
+// WaitForSpiffeCSIDriverConditionReason waits for a SpiffeCSIDriver condition to have the expected status and reason.
+func WaitForSpiffeCSIDriverConditionReason(ctx context.Context, k8sClient client.Client, name, condType string,
+	expectedStatus metav1.ConditionStatus, expectedReason string, timeout time.Duration) {
+	Eventually(func() bool {
+		cr := &operatorv1alpha1.SpiffeCSIDriver{}
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
+			fmt.Fprintf(GinkgoWriter, "failed to get SpiffeCSIDriver '%s': %v\n", name, err)
+			return false
+		}
+		cond := GetConditionByType(cr.Status.Conditions, condType)
+		if cond == nil {
+			fmt.Fprintf(GinkgoWriter, "condition '%s' not found on SpiffeCSIDriver '%s'\n", condType, name)
+			return false
+		}
+		if cond.Status != expectedStatus || cond.Reason != expectedReason {
+			fmt.Fprintf(GinkgoWriter, "SpiffeCSIDriver '%s' condition '%s': status=%s reason=%s, want status=%s reason=%s\n",
+				name, condType, cond.Status, cond.Reason, expectedStatus, expectedReason)
+			return false
+		}
+		return true
+	}).WithTimeout(timeout).WithPolling(ShortInterval).Should(BeTrue(),
+		"SpiffeCSIDriver '%s' condition '%s' should have status=%s reason=%s within %v",
+		name, condType, expectedStatus, expectedReason, timeout)
+}
+
+// WaitForSpireOIDCDiscoveryProviderConditionReason waits for a SpireOIDCDiscoveryProvider condition
+// to have the expected status and reason.
+func WaitForSpireOIDCDiscoveryProviderConditionReason(ctx context.Context, k8sClient client.Client, name, condType string,
+	expectedStatus metav1.ConditionStatus, expectedReason string, timeout time.Duration) {
+	Eventually(func() bool {
+		cr := &operatorv1alpha1.SpireOIDCDiscoveryProvider{}
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: name}, cr); err != nil {
+			fmt.Fprintf(GinkgoWriter, "failed to get SpireOIDCDiscoveryProvider '%s': %v\n", name, err)
+			return false
+		}
+		cond := GetConditionByType(cr.Status.Conditions, condType)
+		if cond == nil {
+			fmt.Fprintf(GinkgoWriter, "condition '%s' not found on SpireOIDCDiscoveryProvider '%s'\n", condType, name)
+			return false
+		}
+		if cond.Status != expectedStatus || cond.Reason != expectedReason {
+			fmt.Fprintf(GinkgoWriter, "SpireOIDCDiscoveryProvider '%s' condition '%s': status=%s reason=%s, want status=%s reason=%s\n",
+				name, condType, cond.Status, cond.Reason, expectedStatus, expectedReason)
+			return false
+		}
+		return true
+	}).WithTimeout(timeout).WithPolling(ShortInterval).Should(BeTrue(),
+		"SpireOIDCDiscoveryProvider '%s' condition '%s' should have status=%s reason=%s within %v",
+		name, condType, expectedStatus, expectedReason, timeout)
+}
+
+// WaitForResourceGone waits until a controller-runtime object is deleted (Get returns NotFound).
+func WaitForResourceGone(ctx context.Context, k8sClient client.Client, obj client.Object, timeout time.Duration) {
+	key := client.ObjectKeyFromObject(obj)
+	Eventually(func() bool {
+		err := k8sClient.Get(ctx, key, obj)
+		if err == nil {
+			fmt.Fprintf(GinkgoWriter, "resource '%s/%s' still exists, waiting for deletion\n", key.Namespace, key.Name)
+			return false
+		}
+		return true
+	}).WithTimeout(timeout).WithPolling(ShortInterval).Should(BeTrue(),
+		"resource '%s/%s' should be deleted within %v", key.Namespace, key.Name, timeout)
+}
+
 // GetUpgradeableCondition fetches the current Upgradeable condition from the OperatorCondition.
 func GetUpgradeableCondition(ctx context.Context, k8sClient client.Client, namespace, operatorConditionName string) (*metav1.Condition, error) {
 	operatorCondition := &operatorv1.OperatorCondition{}
